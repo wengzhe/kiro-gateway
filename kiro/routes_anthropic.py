@@ -45,6 +45,7 @@ from kiro.models_anthropic import (
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
 from kiro.converters_anthropic import anthropic_to_kiro
+from kiro.session_continuation import extract_session_id, resolve_continuation
 from kiro.streaming_anthropic import (
     stream_kiro_to_anthropic,
     collect_anthropic_response,
@@ -372,8 +373,8 @@ async def messages(
             model_cache = account.model_cache
             model_resolver = account.model_resolver
             
-            # Generate conversation ID
-            conversation_id = generate_conversation_id()
+            continuation = resolve_continuation(extract_session_id(request.headers))
+            conversation_id = continuation.conversation_id
             
             # Build payload for Kiro
             # profileArn is required by runtime.kiro.dev for all auth types
@@ -383,7 +384,8 @@ async def messages(
                 kiro_payload = anthropic_to_kiro(
                     request_data,
                     conversation_id,
-                    profile_arn_for_payload
+                    profile_arn_for_payload,
+                    agent_continuation_id=continuation.agent_continuation_id
                 )
             except ValueError as e:
                 logger.error(f"Conversion error: {e}")
@@ -680,8 +682,8 @@ async def messages(
     # Normal Flow (Path B will be intercepted in streaming, or no web_search)
     # ==============================================================================
     
-    # Generate conversation ID for Kiro API (random UUID, not used for tracking)
-    conversation_id = generate_conversation_id()
+    continuation = resolve_continuation(extract_session_id(request.headers))
+    conversation_id = continuation.conversation_id
     
     # Build payload for Kiro
     # profileArn is required by runtime.kiro.dev for all auth types
@@ -691,7 +693,8 @@ async def messages(
         kiro_payload = anthropic_to_kiro(
             request_data,
             conversation_id,
-            profile_arn_for_payload
+            profile_arn_for_payload,
+            agent_continuation_id=continuation.agent_continuation_id
         )
     except ValueError as e:
         logger.error(f"Conversion error: {e}")

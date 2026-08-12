@@ -27,7 +27,7 @@ Loads environment variables and provides typed access to them.
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -275,6 +275,12 @@ HIDDEN_FROM_LIST: List[str] = ["auto"]
 # - Update gateway regularly to get the latest model list
 FALLBACK_MODELS: List[Dict[str, str]] = [
     {"modelId": "auto"},
+    {"modelId": "claude-opus-5"},
+    {"modelId": "claude-sonnet-5"},
+    {"modelId": "claude-opus-4.8"},
+    {"modelId": "gpt-5.6-sol"},
+    {"modelId": "gpt-5.6-terra"},
+    {"modelId": "gpt-5.6-luna"},
     {"modelId": "claude-sonnet-4"},
     {"modelId": "claude-sonnet-4.5"},
     {"modelId": "claude-sonnet-4.6"},
@@ -288,6 +294,100 @@ FALLBACK_MODELS: List[Dict[str, str]] = [
     {"modelId": "minimax-m2.5"},
     {"modelId": "qwen3-coder-next"},
 ]
+
+# ==================================================================================================
+# Native Reasoning Effort Support (additionalModelRequestFields)
+# ==================================================================================================
+
+# Kiro natively supports reasoning effort via the top-level `additionalModelRequestFields`
+# object (sibling of `conversationState`), NOT inside userInputMessage.
+#
+# Two different schemas exist depending on model family:
+#   - GPT family:    {"reasoning": {"effort": <level>}}
+#   - Claude family: {"thinking": {"type": "adaptive", "display": "summarized"},
+#                     "output_config": {"effort": <level>}}
+#
+# Values below are taken verbatim from the Kiro service's own model capability
+# declaration (additionalModelRequestFieldsSchema returned by the model list API).
+# Models NOT listed here reject `additionalModelRequestFields` with HTTP 400
+# ("additionalModelRequestFields is not supported for this model").
+
+EFFORT_SCHEMA_GPT: str = "gpt"
+EFFORT_SCHEMA_CLAUDE: str = "claude"
+
+NATIVE_EFFORT_MODELS: Dict[str, Dict[str, Any]] = {
+    "gpt-5.6-sol": {
+        "schema": EFFORT_SCHEMA_GPT,
+        "values": ("none", "low", "medium", "high", "xhigh", "max"),
+        "default": "high",
+    },
+    "gpt-5.6-terra": {
+        "schema": EFFORT_SCHEMA_GPT,
+        "values": ("none", "low", "medium", "high", "xhigh", "max"),
+        "default": "high",
+    },
+    "gpt-5.6-luna": {
+        "schema": EFFORT_SCHEMA_GPT,
+        "values": ("none", "low", "medium", "high", "xhigh", "max"),
+        "default": "high",
+    },
+    "claude-opus-5": {
+        "schema": EFFORT_SCHEMA_CLAUDE,
+        "values": ("low", "medium", "high", "xhigh", "max"),
+        "default": "high",
+    },
+    "claude-sonnet-5": {
+        "schema": EFFORT_SCHEMA_CLAUDE,
+        "values": ("low", "medium", "high", "xhigh", "max"),
+        "default": "high",
+    },
+    "claude-opus-4.8": {
+        "schema": EFFORT_SCHEMA_CLAUDE,
+        "values": ("low", "medium", "high", "xhigh", "max"),
+        "default": "high",
+    },
+    "claude-opus-4.7": {
+        "schema": EFFORT_SCHEMA_CLAUDE,
+        "values": ("low", "medium", "high", "xhigh", "max"),
+        "default": "xhigh",
+    },
+    "claude-opus-4.6": {
+        "schema": EFFORT_SCHEMA_CLAUDE,
+        "values": ("low", "medium", "high", "max"),
+        "default": "high",
+    },
+    "claude-sonnet-4.6": {
+        "schema": EFFORT_SCHEMA_CLAUDE,
+        "values": ("low", "medium", "high", "max"),
+        "default": "high",
+    },
+}
+
+# Master switch: forward reasoning effort natively instead of faking it via prompt injection.
+NATIVE_EFFORT_ENABLED: bool = os.getenv("NATIVE_EFFORT", "true").lower() in ("1", "true", "yes")
+
+# For Claude models, whether reasoning summaries are streamed back ("summarized") or
+# suppressed ("omitted"). Kiro's own declared enum is ["summarized", "omitted"].
+CLAUDE_THINKING_DISPLAY: str = os.getenv("CLAUDE_THINKING_DISPLAY", "summarized")
+
+# ==================================================================================================
+# Session Continuation (agentContinuationId / agentTaskType)
+# ==================================================================================================
+
+# Official kiro-cli reuses one agentContinuationId + conversationId across every upstream
+# call of the same agent task. Clients are identified by the `x-session-id` header.
+SESSION_CONTINUATION_ENABLED: bool = os.getenv("SESSION_CONTINUATION", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+SESSION_CONTINUATION_MAX_ENTRIES: int = int(os.getenv("SESSION_CONTINUATION_MAX_ENTRIES", "512"))
+SESSION_CONTINUATION_TTL_SECONDS: float = float(
+    os.getenv("SESSION_CONTINUATION_TTL_SECONDS", "86400")
+)
+
+# Observed value in real kiro-cli traffic for interactive/agent chat requests.
+AGENT_TASK_TYPE: str = os.getenv("AGENT_TASK_TYPE", "vibe")
 
 # ==================================================================================================
 # Model Cache Settings

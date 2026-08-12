@@ -404,6 +404,7 @@ async def stream_kiro_to_openai_internal(
         
         if metering_data:
             final_chunk["usage"]["credits_used"] = metering_data
+            logger.info(f"[Credits] {model}: {metering_data}")
         
         # Log final token values being sent to client
         logger.debug(

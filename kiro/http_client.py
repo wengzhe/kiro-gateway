@@ -95,6 +95,15 @@ class KiroHttpClient:
         self._owns_client = shared_client is None
         self.client: Optional[httpx.AsyncClient] = shared_client
     
+    async def _read_error_body(self, response: httpx.Response, stream: bool) -> str:
+        try:
+            if stream:
+                await response.aread()
+            return response.text or ""
+        except Exception as e:
+            logger.debug(f"Could not read error body: {e}")
+            return ""
+
     async def _get_client(self, stream: bool = False) -> httpx.AsyncClient:
         """
         Returns or creates an HTTP client with proper timeouts.
@@ -243,6 +252,27 @@ class KiroHttpClient:
                     logger.warning(f"Received 403, refreshing token (attempt {attempt + 1}/{MAX_RETRIES})")
                     await self.auth_manager.force_refresh()
                     continue
+
+                # 400 - model rejects additionalModelRequestFields: drop it and retry once.
+                # Kiro only accepts this extension for models that advertise it; older
+                # models fail the whole request instead of ignoring the field.
+                if (
+                    response.status_code == 400
+                    and json_data is not None
+                    and "additionalModelRequestFields" in json_data
+                ):
+                    body = await self._read_error_body(response, stream)
+                    if "additionalModelRequestFields" in body:
+                        logger.warning(
+                            "Model rejected additionalModelRequestFields; retrying without native effort"
+                        )
+                        json_data = {
+                            key: value
+                            for key, value in json_data.items()
+                            if key != "additionalModelRequestFields"
+                        }
+                        continue
+                    return response
                 
                 # 429 - rate limit, wait and retry
                 if response.status_code == 429:

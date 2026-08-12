@@ -306,7 +306,7 @@ def reasoning_effort_to_budget(max_tokens: int, effort: str) -> int:
     
     Args:
         max_tokens: Maximum output tokens for the request
-        effort: Reasoning effort level ("none", "minimal", "low", "medium", "high", "xhigh")
+        effort: Reasoning effort level ("none", "minimal", "low", "medium", "high", "xhigh", "max")
     
     Returns:
         Thinking budget in tokens
@@ -323,7 +323,8 @@ def reasoning_effort_to_budget(max_tokens: int, effort: str) -> int:
         "low": 0.20,      # 20% - quick reasoning
         "medium": 0.50,   # 50% - balanced reasoning
         "high": 0.80,     # 80% - deep reasoning
-        "xhigh": 0.95,    # 95% - maximum reasoning depth
+        "xhigh": 0.95,    # 95% - very deep reasoning
+        "max": 0.98,      # 98% - maximum reasoning depth (never 1.0: leaves headroom for the answer)
     }
     return int(max_tokens * percent[effort])
 
@@ -334,7 +335,7 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
     
     Handles reasoning_effort parameter:
     - "none" → disabled (no thinking tags injected)
-    - "minimal", "low", "medium", "high", "xhigh" → enabled with percentage-based budget
+    - "minimal", "low", "medium", "high", "xhigh", "max" → enabled with percentage-based budget
     - None (not specified) → enabled with default budget
     
     Args:
@@ -393,7 +394,8 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
 def build_kiro_payload(
     request_data: ChatCompletionRequest,
     conversation_id: str,
-    profile_arn: str
+    profile_arn: str,
+    agent_continuation_id: Optional[str] = None
 ) -> dict:
     """
     Builds complete payload for Kiro API from OpenAI request.
@@ -440,7 +442,9 @@ def build_kiro_payload(
         tools=unified_tools,
         conversation_id=conversation_id,
         profile_arn=profile_arn,
-        thinking_config=thinking_config
+        thinking_config=thinking_config,
+        effort=request_data.reasoning_effort,
+        agent_continuation_id=agent_continuation_id
     )
     
     return result.payload

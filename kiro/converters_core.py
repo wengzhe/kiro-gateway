@@ -43,6 +43,12 @@ from kiro.config import (
     FAKE_REASONING_BUDGET_CAP,
     KIRO_MAX_PAYLOAD_BYTES,
     AUTO_TRIM_PAYLOAD,
+    AGENT_TASK_TYPE,
+    CLAUDE_THINKING_DISPLAY,
+    EFFORT_SCHEMA_CLAUDE,
+    EFFORT_SCHEMA_GPT,
+    NATIVE_EFFORT_ENABLED,
+    NATIVE_EFFORT_MODELS,
 )
 from kiro.payload_guards import check_payload_size, trim_payload_to_limit
 
@@ -1402,6 +1408,45 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
 # Main Payload Building
 # ==================================================================================================
 
+def supports_native_effort(model_id: str) -> bool:
+    return NATIVE_EFFORT_ENABLED and model_id in NATIVE_EFFORT_MODELS
+
+
+def build_additional_model_request_fields(
+    model_id: str,
+    effort: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """
+    Build Kiro's top-level `additionalModelRequestFields` object.
+
+    Placement matters: this is a sibling of `conversationState`, not a member of
+    `userInputMessage`. Models absent from NATIVE_EFFORT_MODELS reject the whole
+    object with HTTP 400, so callers must gate on supports_native_effort().
+    """
+    if not effort or not supports_native_effort(model_id):
+        return None
+
+    capability = NATIVE_EFFORT_MODELS[model_id]
+    allowed = capability["values"]
+    if effort not in allowed:
+        logger.debug(
+            f"Effort '{effort}' unsupported for {model_id} (allowed: {allowed}); "
+            f"falling back to '{capability['default']}'"
+        )
+        effort = capability["default"]
+
+    if capability["schema"] == EFFORT_SCHEMA_GPT:
+        return {"reasoning": {"effort": effort}}
+
+    if capability["schema"] == EFFORT_SCHEMA_CLAUDE:
+        return {
+            "thinking": {"type": "adaptive", "display": CLAUDE_THINKING_DISPLAY},
+            "output_config": {"effort": effort},
+        }
+
+    return None
+
+
 def build_kiro_payload(
     messages: List[UnifiedMessage],
     system_prompt: str,
@@ -1409,7 +1454,9 @@ def build_kiro_payload(
     tools: Optional[List[UnifiedTool]],
     conversation_id: str,
     profile_arn: str,
-    thinking_config: ThinkingConfig
+    thinking_config: ThinkingConfig,
+    effort: Optional[str] = None,
+    agent_continuation_id: Optional[str] = None,
 ) -> KiroPayloadResult:
     """
     Builds complete payload for Kiro API from unified data.
@@ -1566,20 +1613,28 @@ def build_kiro_payload(
         user_input_message["userInputMessageContext"] = user_input_context
     
     # Assemble final payload
-    payload = {
-        "conversationState": {
-            "chatTriggerType": "MANUAL",
-            "conversationId": conversation_id,
-            "currentMessage": {
-                "userInputMessage": user_input_message
-            }
+    conversation_state: Dict[str, Any] = {
+        "chatTriggerType": "MANUAL",
+        "conversationId": conversation_id,
+        "currentMessage": {
+            "userInputMessage": user_input_message
         }
     }
-    
+
+    if agent_continuation_id:
+        conversation_state["agentContinuationId"] = agent_continuation_id
+        conversation_state["agentTaskType"] = AGENT_TASK_TYPE
+
+    payload = {"conversationState": conversation_state}
+
     # Add history only if not empty
     if history:
         payload["conversationState"]["history"] = history
-    
+
+    additional_fields = build_additional_model_request_fields(model_id, effort)
+    if additional_fields:
+        payload["additionalModelRequestFields"] = additional_fields
+
     # Add profileArn
     if profile_arn:
         payload["profileArn"] = profile_arn

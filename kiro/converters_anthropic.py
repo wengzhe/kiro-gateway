@@ -426,8 +426,23 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
     return ThinkingConfig(enabled=True, budget_tokens=None)
 
 
+def extract_effort_from_anthropic(request: AnthropicMessagesRequest) -> Optional[str]:
+    if isinstance(request.output_config, dict):
+        effort = request.output_config.get("effort")
+        if isinstance(effort, str) and effort:
+            return effort
+
+    if isinstance(request.thinking, dict):
+        effort = request.thinking.get("effort")
+        if isinstance(effort, str) and effort:
+            return effort
+
+    return None
+
+
 def anthropic_to_kiro(
-    request: AnthropicMessagesRequest, conversation_id: str, profile_arn: str
+    request: AnthropicMessagesRequest, conversation_id: str, profile_arn: str,
+    agent_continuation_id: Optional[str] = None
 ) -> dict:
     """
     Converts Anthropic Messages API request to Kiro API payload.
@@ -483,6 +498,8 @@ def anthropic_to_kiro(
         conversation_id=conversation_id,
         profile_arn=profile_arn,
         thinking_config=thinking_config,
+        effort=extract_effort_from_anthropic(request),
+        agent_continuation_id=agent_continuation_id,
     )
 
     return result.payload

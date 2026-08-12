@@ -51,6 +51,7 @@ from kiro.converters_openai import build_kiro_payload
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
+from kiro.session_continuation import extract_session_id, resolve_continuation
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
 
@@ -319,8 +320,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             model_cache = account.model_cache
             model_resolver = account.model_resolver
             
-            # Generate conversation ID
-            conversation_id = generate_conversation_id()
+            continuation = resolve_continuation(extract_session_id(request.headers))
+            conversation_id = continuation.conversation_id
             
             # Build payload for Kiro
             # profileArn is required by runtime.kiro.dev for all auth types
@@ -330,7 +331,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 kiro_payload = build_kiro_payload(
                     request_data,
                     conversation_id,
-                    profile_arn_for_payload
+                    profile_arn_for_payload,
+                    agent_continuation_id=continuation.agent_continuation_id
                 )
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
@@ -567,8 +569,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         model_cache = account.model_cache
         model_resolver = account.model_resolver
     
-    # Generate conversation ID for Kiro API (random UUID, not used for tracking)
-    conversation_id = generate_conversation_id()
+    continuation = resolve_continuation(extract_session_id(request.headers))
+    conversation_id = continuation.conversation_id
     
     # Build payload for Kiro
     # profileArn is required by runtime.kiro.dev for all auth types
@@ -578,7 +580,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         kiro_payload = build_kiro_payload(
             request_data,
             conversation_id,
-            profile_arn_for_payload
+            profile_arn_for_payload,
+            agent_continuation_id=continuation.agent_continuation_id
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
