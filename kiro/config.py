@@ -449,9 +449,10 @@ LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 # Timeout for waiting for the first token from the model (in seconds).
 # If the model doesn't respond within this time, the request will be cancelled and retried.
 # This helps handle "stuck" requests when the model takes too long to think.
-# Default: 30 seconds (recommended for production)
-# Set a lower value (e.g., 10-15) for more aggressive retry.
-FIRST_TOKEN_TIMEOUT: float = float(os.getenv("FIRST_TOKEN_TIMEOUT", "15"))
+# Default: 60 seconds. High-effort reasoning models (opus-5, gpt-5.6-sol at xhigh/max)
+# routinely spend 20-40s before the first token, and a shorter window cancels healthy
+# requests. Set a lower value (e.g. 15-30) for more aggressive retry on fast models.
+FIRST_TOKEN_TIMEOUT: float = float(os.getenv("FIRST_TOKEN_TIMEOUT", "60"))
 
 # Read timeout for streaming responses (in seconds).
 # This is the maximum time to wait for data between chunks during streaming.
@@ -528,10 +529,11 @@ def _warn_timeout_configuration():
 # with <thinking>...</thinking> blocks that we parse and convert to reasoning_content.
 # It works great, but it's a hack - hence "fake" reasoning.
 #
-# Default: true (enabled) - provides premium experience out of the box
+# Default: false. Kiro now exposes native reasoning effort (NATIVE_EFFORT_MODELS), and
+# the injected tags leak into tool calls on newer models — observed on opus-5/opus-4.8
+# as malformed tool invocations, response loops and language mixing.
 _FAKE_REASONING_RAW: str = os.getenv("FAKE_REASONING", "").lower()
-# Default is True - if env var is not set or empty, enable fake reasoning
-FAKE_REASONING_ENABLED: bool = _FAKE_REASONING_RAW not in ("false", "0", "no", "disabled", "off")
+FAKE_REASONING_ENABLED: bool = _FAKE_REASONING_RAW in ("true", "1", "yes", "enabled", "on")
 
 # Maximum thinking length in tokens (default budget when client doesn't specify).
 # This value is injected into the request as <max_thinking_length>{value}</max_thinking_length>
