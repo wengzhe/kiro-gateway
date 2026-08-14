@@ -1306,7 +1306,7 @@ def ensure_alternating_roles(messages: List[UnifiedMessage]) -> List[UnifiedMess
         if msg.role == "user" and prev_role == "user":
             synthetic_assistant = UnifiedMessage(
                 role="assistant",
-                content="(empty placeholder)"  # Consistent with build_kiro_history() placeholder
+                content=""
             )
             result.append(synthetic_assistant)
             synthetic_count += 1
@@ -1387,15 +1387,17 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
             
         elif msg.role == "assistant":
             content = extract_text_content(msg.content)
-            
-            # Fallback for empty content - Kiro API requires non-empty content
-            if not content:
-                content = "(empty placeholder)"
-            
-            assistant_response = {"content": content}
-            
-            # Process tool_calls
             tool_uses = extract_tool_uses_from_message(msg.content, msg.tool_calls)
+
+            # The content key is mandatory (omitting it => REQUEST_BODY_INVALID),
+            # but an empty string is accepted. Never use visible filler here: these
+            # are the model's own turns, tool-only ones are ~20% of them, and the
+            # model imitates the filler by replying with it instead of working.
+            if not content:
+                content = ""
+
+            assistant_response = {"content": content}
+
             if tool_uses:
                 assistant_response["toolUses"] = tool_uses
             

@@ -1710,7 +1710,7 @@ class TestEnsureAlternatingRoles:
         assert result[0].role == "user"
         assert result[0].content == "First"
         assert result[1].role == "assistant"
-        assert result[1].content == "(empty placeholder)"
+        assert result[1].content == ""
         assert result[2].role == "user"
         assert result[2].content == "Second"
     
@@ -1734,11 +1734,11 @@ class TestEnsureAlternatingRoles:
         assert len(result) == 7
         print("Checking alternation pattern...")
         assert result[0].role == "user" and result[0].content == "First"
-        assert result[1].role == "assistant" and result[1].content == "(empty placeholder)"
+        assert result[1].role == "assistant" and result[1].content == ""
         assert result[2].role == "user" and result[2].content == "Second"
-        assert result[3].role == "assistant" and result[3].content == "(empty placeholder)"
+        assert result[3].role == "assistant" and result[3].content == ""
         assert result[4].role == "user" and result[4].content == "Third"
-        assert result[5].role == "assistant" and result[5].content == "(empty placeholder)"
+        assert result[5].role == "assistant" and result[5].content == ""
         assert result[6].role == "user" and result[6].content == "Fourth"
     
     def test_preserves_already_alternating_messages(self):
@@ -1787,15 +1787,15 @@ class TestEnsureAlternatingRoles:
         assert len(result) == 9
         print("Checking first group (A, synthetic, B)...")
         assert result[0].role == "user" and result[0].content == "A"
-        assert result[1].role == "assistant" and result[1].content == "(empty placeholder)"
+        assert result[1].role == "assistant" and result[1].content == ""
         assert result[2].role == "user" and result[2].content == "B"
         print("Checking real assistant...")
         assert result[3].role == "assistant" and result[3].content == "C"
         print("Checking second group (D, synthetic, E, synthetic, F)...")
         assert result[4].role == "user" and result[4].content == "D"
-        assert result[5].role == "assistant" and result[5].content == "(empty placeholder)"
+        assert result[5].role == "assistant" and result[5].content == ""
         assert result[6].role == "user" and result[6].content == "E"
-        assert result[7].role == "assistant" and result[7].content == "(empty placeholder)"
+        assert result[7].role == "assistant" and result[7].content == ""
         assert result[8].role == "user" and result[8].content == "F"
     
     def test_handles_empty_list(self):
@@ -1931,11 +1931,11 @@ class TestNormalizeAndAlternatingIntegration:
         assert len(result) == 7
         print("Checking alternation pattern...")
         assert result[0].role == "user" and result[0].content == "Context 1"
-        assert result[1].role == "assistant" and result[1].content == "(empty placeholder)"
+        assert result[1].role == "assistant" and result[1].content == ""
         assert result[2].role == "user" and result[2].content == "Context 2"
-        assert result[3].role == "assistant" and result[3].content == "(empty placeholder)"
+        assert result[3].role == "assistant" and result[3].content == ""
         assert result[4].role == "user" and result[4].content == "Context 3"
-        assert result[5].role == "assistant" and result[5].content == "(empty placeholder)"
+        assert result[5].role == "assistant" and result[5].content == ""
         assert result[6].role == "user" and result[6].content == "Question"
     
     def test_mixed_roles_are_normalized_and_alternated(self):
@@ -1970,13 +1970,13 @@ class TestNormalizeAndAlternatingIntegration:
         assert len(result) == 9
         print("Checking that all system/developer were converted to user...")
         assert result[0].role == "user" and result[0].content == "System"
-        assert result[1].role == "assistant" and result[1].content == "(empty placeholder)"
+        assert result[1].role == "assistant" and result[1].content == ""
         assert result[2].role == "user" and result[2].content == "Dev"
-        assert result[3].role == "assistant" and result[3].content == "(empty placeholder)"
+        assert result[3].role == "assistant" and result[3].content == ""
         assert result[4].role == "user" and result[4].content == "User1"
         assert result[5].role == "assistant" and result[5].content == "Assistant1"
         assert result[6].role == "user" and result[6].content == "Dev2"
-        assert result[7].role == "assistant" and result[7].content == "(empty placeholder)"
+        assert result[7].role == "assistant" and result[7].content == ""
         assert result[8].role == "user" and result[8].content == "User2"
 
 
@@ -3933,7 +3933,7 @@ class TestBuildKiroHistory:
         print(f"Result: {result}")
         print(f"Content: '{result[0]['assistantResponseMessage']['content']}'")
         print("Checking that '(empty placeholder)' placeholder is added...")
-        assert result[0]["assistantResponseMessage"]["content"] == "(empty placeholder)"
+        assert result[0]["assistantResponseMessage"]["content"] == ""
     
     def test_adds_empty_placeholder_for_none_user_content(self):
         """
@@ -3965,7 +3965,7 @@ class TestBuildKiroHistory:
         print(f"Result: {result}")
         print(f"Content: '{result[0]['assistantResponseMessage']['content']}'")
         print("Checking that '(empty placeholder)' placeholder is added...")
-        assert result[0]["assistantResponseMessage"]["content"] == "(empty placeholder)"
+        assert result[0]["assistantResponseMessage"]["content"] == ""
     
     def test_preserves_non_empty_content_in_history(self):
         """
@@ -4011,7 +4011,7 @@ class TestBuildKiroHistory:
         assert result[0]["userInputMessage"]["content"] == "Start"
         
         print(f"Message 1 content: '{result[1]['assistantResponseMessage']['content']}'")
-        assert result[1]["assistantResponseMessage"]["content"] == "(empty placeholder)"
+        assert result[1]["assistantResponseMessage"]["content"] == ""
         
         print(f"Message 2 content: '{result[2]['userInputMessage']['content']}'")
         assert result[2]["userInputMessage"]["content"] == "(empty placeholder)"
