@@ -275,6 +275,8 @@ HIDDEN_FROM_LIST: List[str] = ["auto"]
 # - Update gateway regularly to get the latest model list
 FALLBACK_MODELS: List[Dict[str, str]] = [
     {"modelId": "auto"},
+    {"modelId": "claude-opus-5.5"},
+    {"modelId": "claude-sonnet-5.5"},
     {"modelId": "claude-opus-5"},
     {"modelId": "claude-sonnet-5"},
     {"modelId": "claude-opus-4.8"},
@@ -329,6 +331,16 @@ NATIVE_EFFORT_MODELS: Dict[str, Dict[str, Any]] = {
     "gpt-5.6-luna": {
         "schema": EFFORT_SCHEMA_GPT,
         "values": ("none", "low", "medium", "high", "xhigh", "max"),
+        "default": "high",
+    },
+    "claude-opus-5.5": {
+        "schema": EFFORT_SCHEMA_CLAUDE,
+        "values": ("low", "medium", "high", "xhigh", "max"),
+        "default": "medium",
+    },
+    "claude-sonnet-5.5": {
+        "schema": EFFORT_SCHEMA_CLAUDE,
+        "values": ("low", "medium", "high", "xhigh", "max"),
         "default": "high",
     },
     "claude-opus-5": {
