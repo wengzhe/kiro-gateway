@@ -1077,6 +1077,27 @@ class TestMergeAdjacentMessages:
         assert "Hello" in result[0].content
         assert "World" in result[0].content
     
+    def test_preserves_images_when_merging_user_messages(self):
+        """
+        What it does: Verifies images survive merging a tool_results message with an image message.
+        Purpose: opencode sends tool-result images as a follow-up user message; they must not be dropped.
+        """
+        image = {"media_type": "image/png", "data": "abc123"}
+        messages = [
+            UnifiedMessage(
+                role="user",
+                content="",
+                tool_results=[{"type": "tool_result", "tool_use_id": "call_1", "content": "ok"}],
+            ),
+            UnifiedMessage(role="user", content="Attached media from tool result:", images=[image]),
+        ]
+        
+        result = merge_adjacent_messages(messages)
+        
+        assert len(result) == 1
+        assert result[0].images == [image]
+        assert result[0].tool_results[0]["tool_use_id"] == "call_1"
+    
     def test_preserves_alternating_messages(self):
         """
         What it does: Verifies preservation of alternating messages.

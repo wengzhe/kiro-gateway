@@ -1129,6 +1129,11 @@ def merge_adjacent_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessa
                 last.tool_results = list(last.tool_results) + list(msg.tool_results)
                 total_tool_results_merged += len(msg.tool_results)
             
+            # Merge images (e.g. opencode sends tool-result images as a separate
+            # follow-up user message, which lands adjacent to the tool_results message)
+            if msg.images:
+                last.images = list(last.images or []) + list(msg.images)
+            
             # Count merges by role
             if msg.role in merge_counts:
                 merge_counts[msg.role] += 1
