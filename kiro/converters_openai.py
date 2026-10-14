@@ -374,7 +374,7 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
     max_tokens = request.max_tokens or request.max_completion_tokens
     if not max_tokens:
         # Fallback to reasonable default for OUTPUT tokens
-        # NOT DEFAULT_MAX_INPUT_TOKENS (200000) - that's for INPUT
+        # NOT DEFAULT_MAX_INPUT_TOKENS - that's for INPUT
         max_tokens = 4096  # Standard output limit
     
     budget = reasoning_effort_to_budget(max_tokens, request.reasoning_effort)

@@ -408,8 +408,10 @@ AGENT_TASK_TYPE: str = os.getenv("AGENT_TASK_TYPE", "vibe")
 # Model cache TTL in seconds (1 hour)
 MODEL_CACHE_TTL: int = 3600
 
-# Default maximum number of input tokens
-DEFAULT_MAX_INPUT_TOKENS: int = 200000
+# Scale for converting Kiro's contextUsagePercentage into token counts. FALLBACK_MODELS
+# carry no tokenLimits, so every model uses this value; clients must configure the
+# same context limit or their compaction threshold drifts.
+DEFAULT_MAX_INPUT_TOKENS: int = 1048576
 
 # ==================================================================================================
 # Tool Description Handling (Kiro API Limitations)
