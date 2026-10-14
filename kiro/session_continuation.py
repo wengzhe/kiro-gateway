@@ -6,9 +6,12 @@ upstream call belonging to the same agent task, and only generates new ones for 
 new session. Verified by capturing real kiro-cli traffic: two tool-use round trips
 shared `bfaf422e-...`, while a fresh session produced `2a9bc885-...`.
 
-Clients identify their session via the `x-session-id` header (opencode sends both
-`x-session-id` and `x-session-affinity`). Requests without that header fall back to
-per-request identifiers, preserving the previous stateless behaviour.
+Clients identify their session via a session header. opencode 1.18.34+ sends the
+namespaced `x-opencode-session-id` alongside the legacy `x-session-id` and
+`x-session-affinity` (all carrying the same value, verified on opencode 1.19.0).
+The namespaced header is read first so continuation keeps working if the legacy
+ones are ever dropped. Requests without any of them fall back to per-request
+identifiers, preserving the previous stateless behaviour.
 """
 
 import threading
@@ -24,7 +27,7 @@ from kiro.config import (
     SESSION_CONTINUATION_TTL_SECONDS,
 )
 
-SESSION_ID_HEADERS = ("x-session-id", "x-session-affinity")
+SESSION_ID_HEADERS = ("x-opencode-session-id", "x-session-id", "x-session-affinity")
 
 
 @dataclass
