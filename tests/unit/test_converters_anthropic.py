@@ -23,6 +23,7 @@ from kiro.converters_anthropic import (
     extract_tool_uses_from_anthropic_content,
     convert_anthropic_messages,
     convert_anthropic_tools,
+    partition_system_messages,
     anthropic_to_kiro,
     extract_thinking_config_from_anthropic,
 )
@@ -1884,3 +1885,286 @@ class TestAnthropicToKiroIntegration:
         print(f"Checking for <max_thinking_length>6000</max_thinking_length>...")
         assert "<max_thinking_length>6000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+class TestServerSideToolFiltering:
+    """Tests that Anthropic server-side tools are dropped before reaching Kiro."""
+
+    def test_drops_server_side_tool_keeps_client_tool(self):
+        """
+        What it does: Verifies a mixed tool list keeps only the client-defined tool.
+        Purpose: Kiro rejects the whole request with REQUEST_BODY_INVALID if
+                 server-side tools are forwarded.
+        """
+        print("Setup: One client tool plus two server-side tools...")
+        tools = [
+            AnthropicTool(name="get_weather", input_schema={"type": "object"}),
+            AnthropicTool(name="code_execution", type="code_execution_20250522"),
+            AnthropicTool(name="web_search", type="web_search_20250305"),
+        ]
+
+        print("Action: Converting tools...")
+        result = convert_anthropic_tools(tools)
+
+        print(f"Result: {[t.name for t in result]}")
+        assert len(result) == 1
+        assert result[0].name == "get_weather"
+
+    def test_returns_none_when_all_tools_filtered(self):
+        """
+        What it does: Verifies None is returned when only server-side tools are sent.
+        Purpose: Downstream code treats None as "no tools" and strips tool content.
+        """
+        print("Setup: Only server-side tools...")
+        tools = [
+            AnthropicTool(name="web_search", type="web_search_20250305"),
+            AnthropicTool(name="code_execution", type="code_execution_20250522"),
+        ]
+
+        print("Action: Converting tools...")
+        result = convert_anthropic_tools(tools)
+
+        print(f"Result: {result}")
+        assert result is None
+
+    def test_keeps_explicit_custom_type_tool(self):
+        """
+        What it does: Verifies type="custom" is treated as a client tool, not server-side.
+        Purpose: "custom" is the explicit marker for client tools and must survive.
+        """
+        print("Setup: Tool with explicit type='custom'...")
+        tools = [
+            AnthropicTool(name="my_tool", type="custom", input_schema={"type": "object"})
+        ]
+
+        print("Action: Converting tools...")
+        result = convert_anthropic_tools(tools)
+
+        print(f"Result: {[t.name for t in result]}")
+        assert len(result) == 1
+        assert result[0].name == "my_tool"
+
+    def test_retained_tool_schema_is_always_dict(self):
+        """
+        What it does: Verifies retained tools never carry a None input_schema.
+        Purpose: Kiro payload serialization expects a schema object, not null.
+        """
+        print("Setup: Client tool supplied as a dict without input_schema key...")
+        result = convert_anthropic_tools(
+            [{"name": "d1", "input_schema": {"type": "object"}}]
+        )
+
+        print(f"Result: schema={result[0].input_schema!r}")
+        assert isinstance(result[0].input_schema, dict)
+
+    def test_filters_server_side_tool_from_dict_input(self):
+        """
+        What it does: Verifies filtering also works when tools arrive as plain dicts.
+        Purpose: Both Pydantic models and raw dicts reach this converter.
+        """
+        print("Setup: Dict-form client tool plus dict-form server-side tool...")
+        result = convert_anthropic_tools(
+            [
+                {"name": "d1", "input_schema": {"type": "object"}},
+                {"name": "d2", "type": "code_execution_20250522"},
+            ]
+        )
+
+        print(f"Result: {[t.name for t in result]}")
+        assert [t.name for t in result] == ["d1"]
+
+
+class TestClientToolSchemaValidation:
+    """Tests that client-defined tools must declare an input_schema."""
+
+    def test_rejects_explicit_custom_type_without_schema(self):
+        """
+        What it does: Verifies type="custom" without input_schema is rejected.
+        Purpose: A custom tool with no schema is malformed and must not be
+                 silently filtered as if it were a server-side tool.
+        """
+        print("Setup: type='custom' with no input_schema...")
+        with pytest.raises(Exception) as exc_info:
+            AnthropicTool(name="bad", type="custom")
+
+        print(f"Result: rejected with {type(exc_info.value).__name__}")
+        assert "input_schema" in str(exc_info.value)
+
+    def test_rejects_missing_type_without_schema(self):
+        """
+        What it does: Verifies a tool with neither type nor input_schema is rejected.
+        Purpose: Preserves the pre-existing validation contract.
+        """
+        print("Setup: No type and no input_schema...")
+        with pytest.raises(Exception) as exc_info:
+            AnthropicTool(name="bad")
+
+        print(f"Result: rejected with {type(exc_info.value).__name__}")
+        assert "input_schema" in str(exc_info.value)
+
+    def test_accepts_server_side_tool_without_schema(self):
+        """
+        What it does: Verifies server-side tools are accepted without input_schema.
+        Purpose: Anthropic executes them, so they legitimately carry no schema.
+        """
+        print("Setup: Server-side tool with no input_schema...")
+        tool = AnthropicTool(name="web_search", type="web_search_20250305")
+
+        print(f"Result: accepted, type={tool.type}")
+        assert tool.input_schema is None
+
+
+class TestPartitionSystemMessages:
+    """Tests for in-band system message extraction."""
+
+    def test_extracts_and_removes_system_messages(self):
+        """
+        What it does: Verifies system messages are pulled out in encounter order.
+        Purpose: Kiro has no in-band system message concept.
+        """
+        print("Setup: system, user, system...")
+        messages = [
+            AnthropicMessage(role="system", content="SYS-A"),
+            AnthropicMessage(role="user", content="hi"),
+            AnthropicMessage(role="system", content="SYS-B"),
+        ]
+
+        print("Action: Partitioning...")
+        remaining, system_text = partition_system_messages(messages)
+
+        print(f"Result: roles={[m.role for m in remaining]} text={system_text!r}")
+        assert [m.role for m in remaining] == ["user"]
+        assert system_text == "SYS-A\n\nSYS-B"
+
+    def test_returns_empty_text_without_system_messages(self):
+        """
+        What it does: Verifies a normal conversation is passed through untouched.
+        Purpose: The common path must not be altered.
+        """
+        print("Setup: user, assistant...")
+        messages = [
+            AnthropicMessage(role="user", content="hi"),
+            AnthropicMessage(role="assistant", content="hello"),
+        ]
+
+        print("Action: Partitioning...")
+        remaining, system_text = partition_system_messages(messages)
+
+        print(f"Result: roles={[m.role for m in remaining]} text={system_text!r}")
+        assert len(remaining) == 2
+        assert system_text == ""
+
+    def test_ignores_blank_system_messages(self):
+        """
+        What it does: Verifies whitespace-only system messages contribute nothing.
+        Purpose: Avoids injecting blank separators into the system prompt.
+        """
+        print("Setup: whitespace-only system message...")
+        messages = [
+            AnthropicMessage(role="system", content="   "),
+            AnthropicMessage(role="user", content="x"),
+        ]
+
+        print("Action: Partitioning...")
+        remaining, system_text = partition_system_messages(messages)
+
+        print(f"Result: text={system_text!r}")
+        assert system_text == ""
+
+    def test_system_only_request_leaves_no_messages(self):
+        """
+        What it does: Verifies a system-only array yields no remaining messages.
+        Purpose: Documents that anthropic_to_kiro then raises ValueError, which
+                 routes translate into HTTP 400.
+        """
+        print("Setup: only a system message...")
+        remaining, system_text = partition_system_messages(
+            [AnthropicMessage(role="system", content="only")]
+        )
+
+        print(f"Result: remaining={remaining} text={system_text!r}")
+        assert remaining == []
+        assert system_text == "only"
+
+
+class TestInBandSystemMessageIntegration:
+    """End-to-end tests for in-band system messages reaching the Kiro payload."""
+
+    def test_inband_system_text_reaches_payload(self):
+        """
+        What it does: Verifies in-band system text lands in the Kiro payload.
+        Purpose: The whole point of partitioning is preserving the instruction.
+        """
+        print("Setup: Request with an in-band system message...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            messages=[
+                AnthropicMessage(role="system", content="BE-TERSE"),
+                AnthropicMessage(role="user", content="hi"),
+            ],
+            max_tokens=1024,
+        )
+
+        print("Action: Converting to Kiro payload...")
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-sonnet-4.5",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                payload = anthropic_to_kiro(request, "conv-1", "arn:aws:test")
+
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        print(f"Result: content contains BE-TERSE = {'BE-TERSE' in content}")
+        assert "BE-TERSE" in content
+
+    def test_top_level_system_precedes_inband_system(self):
+        """
+        What it does: Verifies top-level system text appears before in-band text.
+        Purpose: Top-level system is the authoritative prompt; in-band is appended.
+        """
+        print("Setup: Both top-level and in-band system text...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            system="TOP-LEVEL",
+            messages=[
+                AnthropicMessage(role="system", content="IN-BAND"),
+                AnthropicMessage(role="user", content="hi"),
+            ],
+            max_tokens=1024,
+        )
+
+        print("Action: Converting to Kiro payload...")
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-sonnet-4.5",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                payload = anthropic_to_kiro(request, "conv-1", "arn:aws:test")
+
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        print(f"Result: TOP-LEVEL at {content.find('TOP-LEVEL')}, IN-BAND at {content.find('IN-BAND')}")
+        assert "TOP-LEVEL" in content
+        assert "IN-BAND" in content
+        assert content.find("TOP-LEVEL") < content.find("IN-BAND")
+
+    def test_system_only_request_raises_value_error(self):
+        """
+        What it does: Verifies a system-only request raises ValueError.
+        Purpose: Routes convert this into HTTP 400 rather than a 500.
+        """
+        print("Setup: Request containing only a system message...")
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4-5",
+            messages=[AnthropicMessage(role="system", content="only")],
+            max_tokens=1024,
+        )
+
+        print("Action: Converting, expecting ValueError...")
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-sonnet-4.5",
+        ):
+            with pytest.raises(ValueError, match="No messages to send"):
+                anthropic_to_kiro(request, "conv-1", "arn:aws:test")
+
+        print("Result: ValueError raised as expected")

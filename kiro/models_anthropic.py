@@ -183,11 +183,18 @@ class AnthropicMessage(BaseModel):
     Message in Anthropic format.
 
     Attributes:
-        role: Message role (user or assistant)
+        role: Message role (user, assistant, or system)
         content: Message content (string or list of content blocks)
+
+    Note:
+        The official Anthropic Messages API only allows "user" and "assistant"
+        in the messages array, but newer Claude Code versions also send
+        "system" entries there. Kiro has no in-band system message concept, so
+        these are accepted here and partitioned into the system prompt during
+        conversion rather than rejected with a 422.
     """
 
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "system"]
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}
@@ -235,15 +242,23 @@ class AnthropicTool(BaseModel):
     
     @model_validator(mode="after")
     def validate_tool_consistency(self):
-        """Validate that user-defined tools have input_schema."""
-        is_server_side = self.type is not None
+        """
+        Validate that client-defined tools have input_schema.
+
+        A tool is client-defined when 'type' is absent or explicitly "custom";
+        the Anthropic API requires input_schema for those. Any other 'type'
+        value denotes an Anthropic server-side tool (e.g. "web_search_20250305",
+        "code_execution_20250522"), which carries no input_schema because it is
+        executed by Anthropic's infrastructure.
+        """
+        is_server_side = self.type is not None and self.type != "custom"
         
         if not is_server_side:
-            # User-defined tool: input_schema is required
+            # Client-defined tool: input_schema is required
             if self.input_schema is None:
                 raise ValueError(
-                    "input_schema is required for user-defined tools "
-                    "(those without a 'type' field)"
+                    "input_schema is required for client-defined tools "
+                    "(those without a 'type' field or with type='custom')"
                 )
         return self
 

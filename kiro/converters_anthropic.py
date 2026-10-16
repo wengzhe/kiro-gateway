@@ -24,7 +24,7 @@ This module is an adapter layer that converts Anthropic-specific formats
 to the unified format used by converters_core.py.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -255,6 +255,45 @@ def extract_tool_uses_from_anthropic_content(content: Any) -> List[Dict[str, Any
     return tool_calls
 
 
+def partition_system_messages(
+    messages: List[AnthropicMessage],
+) -> Tuple[List[AnthropicMessage], str]:
+    """
+    Separates system-role messages from the messages array.
+
+    Newer Claude Code versions put "system" entries inside the messages array
+    even though the official Anthropic API only allows user/assistant there.
+    Kiro has no in-band system message concept, so their text is pulled out to
+    be merged into the system prompt instead of being coerced into a user turn
+    (which would change instruction priority and perturb role alternation).
+
+    Args:
+        messages: Anthropic messages, possibly containing system-role items
+
+    Returns:
+        Tuple of (messages without system items, extracted system text)
+    """
+    remaining: List[AnthropicMessage] = []
+    system_texts: List[str] = []
+
+    for msg in messages:
+        if msg.role == "system":
+            text = convert_anthropic_content_to_text(msg.content)
+            if text.strip():
+                system_texts.append(text)
+        else:
+            remaining.append(msg)
+
+    combined = "\n\n".join(system_texts)
+    if combined:
+        logger.info(
+            f"Moved {len(system_texts)} in-band system message(s) "
+            f"({len(combined)} chars total) into the system prompt"
+        )
+
+    return remaining, combined
+
+
 def convert_anthropic_messages(
     messages: List[AnthropicMessage],
 ) -> List[UnifiedMessage]:
@@ -340,31 +379,54 @@ def convert_anthropic_tools(
     tools: Optional[List[AnthropicTool]],
 ) -> Optional[List[UnifiedTool]]:
     """
-    Converts Anthropic tools to unified format.
+    Converts Anthropic tools to unified format, dropping server-side tools.
+
+    Anthropic server-side tools (e.g. "web_search_20250305",
+    "code_execution_20250522") are executed by Anthropic's own infrastructure
+    and carry no input_schema. Kiro only accepts client-defined tools and
+    rejects the whole request with REQUEST_BODY_INVALID if they are forwarded,
+    so they are filtered out here.
 
     Args:
         tools: List of Anthropic tools
 
     Returns:
-        List of tools in unified format, or None if no tools
+        List of usable tools in unified format, or None if none remain
     """
     if not tools:
         return None
 
     unified_tools = []
+    skipped_server_tools = []
     for tool in tools:
         # Handle both dict and Pydantic model
         if isinstance(tool, dict):
             name = tool.get("name", "")
             description = tool.get("description")
-            input_schema = tool.get("input_schema", {})
+            input_schema = tool.get("input_schema")
+            tool_type = tool.get("type") or "custom"
         else:
             name = tool.name
             description = tool.description
             input_schema = tool.input_schema
+            tool_type = getattr(tool, "type", None) or "custom"
+
+        if tool_type != "custom" and input_schema is None:
+            skipped_server_tools.append(f"{name} (type={tool_type})")
+            continue
 
         unified_tools.append(
-            UnifiedTool(name=name, description=description, input_schema=input_schema)
+            UnifiedTool(
+                name=name,
+                description=description,
+                input_schema=input_schema if input_schema is not None else {},
+            )
+        )
+
+    if skipped_server_tools:
+        logger.warning(
+            f"Skipped {len(skipped_server_tools)} Anthropic server-side tool(s) "
+            f"that Kiro cannot execute: {', '.join(skipped_server_tools)}"
         )
 
     return unified_tools if unified_tools else None
@@ -465,8 +527,10 @@ def anthropic_to_kiro(
     Raises:
         ValueError: If there are no messages to send
     """
+    effective_messages, inband_system = partition_system_messages(request.messages)
+
     # Convert messages to unified format
-    unified_messages = convert_anthropic_messages(request.messages)
+    unified_messages = convert_anthropic_messages(effective_messages)
 
     # Convert tools to unified format
     unified_tools = convert_anthropic_tools(request.tools)
@@ -474,6 +538,10 @@ def anthropic_to_kiro(
     # System prompt is already separate in Anthropic format!
     # It can be a string or list of content blocks (for prompt caching)
     system_prompt = extract_system_prompt(request.system)
+
+    # Top-level system takes precedence; in-band blocks follow in encounter order
+    if inband_system:
+        system_prompt = f"{system_prompt}\n\n{inband_system}" if system_prompt else inband_system
 
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid
