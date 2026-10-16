@@ -407,3 +407,31 @@ class TestCliVersion:
         print(f"APP_VERSION: {APP_VERSION}")
         
         assert APP_VERSION in captured.out
+
+class TestValidateConfigurationClientProfile:
+    """Tests for KIRO_CLIENT_PROFILE validation at startup."""
+
+    @pytest.mark.parametrize("bad", ["desktop", "kiro_cli", "x"])
+    def test_invalid_profile_exits(self, bad):
+        """
+        What it does: Runs validate_configuration with an invalid profile.
+        Purpose: Typos stop startup with a clear error instead of failing per request.
+        """
+        import main
+        with patch("kiro.config.KIRO_CLIENT_PROFILE", bad):
+            with pytest.raises(SystemExit) as exc_info:
+                main.validate_configuration()
+        assert exc_info.value.code == 1
+
+    @pytest.mark.parametrize("good", ["auto", "cli", "ide"])
+    def test_valid_profile_does_not_exit_on_profile_check(self, good, tmp_path, monkeypatch):
+        """
+        What it does: Runs validate_configuration with valid values and credentials.json present.
+        Purpose: Valid profiles pass the check (credentials.json short-circuits the rest).
+        """
+        import main
+        creds = tmp_path / "credentials.json"
+        creds.write_text("[]")
+        with patch("kiro.config.KIRO_CLIENT_PROFILE", good), \
+             patch("kiro.config.ACCOUNTS_CONFIG_FILE", str(creds)):
+            main.validate_configuration()

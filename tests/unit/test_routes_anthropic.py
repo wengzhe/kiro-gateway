@@ -2519,3 +2519,74 @@ class TestCountTokensEndpoint:
         assert data["input_tokens"] > 0
         
         print("✅ max_tokens is NOT required for count_tokens")
+
+
+# =============================================================================
+# Tests for client profile URL selection (KIRO_CLIENT_PROFILE)
+# =============================================================================
+
+class TestClientProfileUrlAnthropic:
+    """
+    Verifies Anthropic routes build the Kiro URL from the account's client profile
+    in every mode: streaming/non-streaming x legacy/account-system.
+    """
+
+    @staticmethod
+    def _send(test_client, valid_proxy_api_key, profile, stream, account_system, monkeypatch):
+        from kiro.client_profiles import PROFILES, ClientProfileName
+
+        state = test_client.app.state
+        account = state.account_manager.get_first_account()
+        assert account is not None and account.auth_manager is not None
+        monkeypatch.setattr(account.auth_manager, "_client_profile", PROFILES[ClientProfileName(profile)])
+        monkeypatch.setattr(state, "account_system", account_system)
+        if account_system:
+            monkeypatch.setattr(state.account_manager, "get_next_account", AsyncMock(return_value=account))
+            monkeypatch.setattr(state.account_manager, "report_failure", AsyncMock())
+            monkeypatch.setattr(state.account_manager, "report_success", AsyncMock())
+
+        with patch("kiro.routes_anthropic.KiroHttpClient") as mock_http_class:
+            mock_client = AsyncMock()
+            mock_client.request_with_retry = AsyncMock(side_effect=RuntimeError("Network blocked"))
+            mock_client.close = AsyncMock()
+            mock_http_class.return_value = mock_client
+            try:
+                test_client.post("/v1/messages", headers={"x-api-key": valid_proxy_api_key, "anthropic-version": "2023-06-01"}, json={"model": "claude-sonnet-4-5", "max_tokens": 64, "messages": [{"role": "user", "content": "Hello"}], "stream": stream})
+            except RuntimeError:
+                pass
+        assert mock_client.request_with_retry.called, "Kiro request was not attempted"
+        return account.auth_manager.api_region, mock_client.request_with_retry.call_args
+
+    @pytest.mark.parametrize("profile, host_template, origin", [
+        ("cli", "https://q.{region}.amazonaws.com/", "KIRO_CLI"),
+        ("ide", "https://runtime.{region}.kiro.dev/", "AI_EDITOR"),
+    ])
+    @pytest.mark.parametrize("stream", [True, False])
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_profile_url_and_origin(
+        self, test_client, valid_proxy_api_key, monkeypatch, profile, host_template, origin, stream, account_system
+    ):
+        """
+        What it does: Sends a chat request per profile in every mode.
+        Purpose: Host/path and payload origin must match the official client
+        (kiro-cli: q host, KIRO_CLI; Kiro IDE: runtime host, AI_EDITOR).
+        """
+        region, call = self._send(test_client, valid_proxy_api_key, profile, stream, account_system, monkeypatch)
+        method, url, payload = call.args[0], call.args[1], call.args[2]
+        print(f"{profile} stream={stream} account_system={account_system} -> {method} {url}")
+        assert method == "POST"
+        assert url == host_template.format(region=region)
+        user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert user_input["origin"] == origin
+
+    @pytest.mark.parametrize("profile", ["cli", "ide"])
+    def test_generate_operation_used_for_headers(self, test_client, valid_proxy_api_key, monkeypatch, profile):
+        """
+        What it does: Checks the operation passed to the HTTP client.
+        Purpose: Chat requests must never be sent with ListAvailableModels headers.
+        """
+        from kiro.client_profiles import KiroOperation
+
+        _, call = self._send(test_client, valid_proxy_api_key, profile, False, False, monkeypatch)
+        operation = call.kwargs.get("operation", KiroOperation.GENERATE_ASSISTANT_RESPONSE)
+        assert operation == KiroOperation.GENERATE_ASSISTANT_RESPONSE

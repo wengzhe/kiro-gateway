@@ -790,6 +790,18 @@ Commonly reachable regions: `us-east-1`, `eu-central-1`
 
 ---
 
+**Error: "404 Not Found" on chat requests (while `/v1/models` works)**
+
+Some networks (e.g. corporate reverse proxies in front of Kiro API) only route the hosts/paths of one official client. Switch the client profile (`cli` = kiro-cli, `ide` = Kiro IDE):
+
+```env
+KIRO_CLIENT_PROFILE="cli"
+```
+
+`auto` (default) picks `cli` for kiro-cli credentials and `ide` for Kiro IDE credentials. Per-account override: `"client_profile": "cli"` in `credentials.json`.
+
+---
+
 **OIDC works but Q API fails**
 
 Your SSO region may differ from the Q API region. The gateway auto-detects this from credentials, but you can override:

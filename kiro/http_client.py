@@ -40,6 +40,7 @@ from loguru import logger
 
 from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
 from kiro.auth import KiroAuthManager
+from kiro.client_profiles import KiroOperation
 from kiro.utils import get_kiro_headers
 from kiro.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
 
@@ -182,7 +183,8 @@ class KiroHttpClient:
         url: str,
         json_data: Optional[dict] = None,
         params: Optional[dict] = None,
-        stream: bool = False
+        stream: bool = False,
+        operation: KiroOperation = KiroOperation.GENERATE_ASSISTANT_RESPONSE,
     ) -> httpx.Response:
         """
         Executes an HTTP request with retry logic.
@@ -202,6 +204,8 @@ class KiroHttpClient:
             json_data: Optional JSON body (for POST/PUT/PATCH)
             params: Optional query parameters (for GET)
             stream: Use streaming (default False)
+            operation: Kiro operation, selects profile-specific headers
+                (default GenerateAssistantResponse)
         
         Returns:
             httpx.Response with successful response
@@ -222,7 +226,7 @@ class KiroHttpClient:
             try:
                 # Get current token
                 token = await self.auth_manager.get_access_token()
-                headers = get_kiro_headers(self.auth_manager, token)
+                headers = get_kiro_headers(self.auth_manager, token, operation)
                 
                 # Build request kwargs based on parameters
                 request_kwargs = {"headers": headers}

@@ -221,6 +221,15 @@ def validate_configuration() -> None:
     Raises:
         SystemExit: If critical configuration is missing
     """
+    # Client profile is used by every account type - fail fast on typos
+    from kiro.config import KIRO_CLIENT_PROFILE
+    from kiro.client_profiles import parse_profile_name
+    try:
+        parse_profile_name(KIRO_CLIENT_PROFILE)
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(1)
+    
     # Priority 1: Check if credentials.json exists (Account System)
     # If it exists, legacy .env validation is skipped
     from kiro.config import ACCOUNTS_CONFIG_FILE

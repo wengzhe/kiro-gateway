@@ -1281,3 +1281,61 @@ class TestKiroHttpClientRequestParameters:
         assert captured_kwargs["params"]["filter"] == "active"
         assert json.loads(captured_kwargs["content"])["data"] == "value"
         assert response.status_code == 200
+
+class TestKiroHttpClientOperationHeaders:
+    """Tests that request_with_retry builds headers for the requested operation."""
+
+    @pytest.mark.asyncio
+    async def test_default_operation_is_generate(self, mock_auth_manager_for_http):
+        """
+        What it does: Calls request_with_retry without operation.
+        Purpose: Backward compatible default for chat requests.
+        """
+        from kiro.client_profiles import KiroOperation
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(return_value=Mock(status_code=200))
+        with patch.object(http_client, "_get_client", return_value=mock_client), \
+             patch("kiro.http_client.get_kiro_headers", return_value={}) as mock_headers:
+            await http_client.request_with_retry("POST", "https://h/", {"a": 1})
+        assert mock_headers.call_args.args[2] == KiroOperation.GENERATE_ASSISTANT_RESPONSE
+
+    @pytest.mark.asyncio
+    async def test_operation_passed_on_every_retry(self, mock_auth_manager_for_http):
+        """
+        What it does: Forces a 403 then 200 with LIST operation.
+        Purpose: Retried attempts must keep the same operation headers.
+        """
+        from kiro.client_profiles import KiroOperation
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(side_effect=[Mock(status_code=403), Mock(status_code=200)])
+        with patch.object(http_client, "_get_client", return_value=mock_client), \
+             patch("kiro.http_client.get_kiro_headers", return_value={}) as mock_headers:
+            await http_client.request_with_retry(
+                "POST", "https://h/", {"origin": "KIRO_CLI"},
+                operation=KiroOperation.LIST_AVAILABLE_MODELS,
+            )
+        assert mock_headers.call_count == 2
+        assert all(c.args[2] == KiroOperation.LIST_AVAILABLE_MODELS for c in mock_headers.call_args_list)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("profile, expect_target", [
+        ("cli", "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"),
+        ("ide", "KiroRuntimeService.GenerateAssistantResponse"),
+    ])
+    async def test_real_headers_follow_auth_manager_profile(self, mock_auth_manager_for_http, profile, expect_target):
+        """
+        What it does: Uses real get_kiro_headers with a profile on the auth manager.
+        Purpose: End-to-end check that the HTTP client sends profile headers.
+        """
+        from kiro.client_profiles import PROFILES, ClientProfileName
+        mock_auth_manager_for_http.client_profile = PROFILES[ClientProfileName(profile)]
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        mock_client = AsyncMock()
+        mock_client.request = AsyncMock(return_value=Mock(status_code=200))
+        with patch.object(http_client, "_get_client", return_value=mock_client):
+            await http_client.request_with_retry("POST", "https://h/", {"a": 1})
+        headers = mock_client.request.call_args.kwargs["headers"]
+        assert headers["x-amz-target"] == expect_target
+        assert headers["Authorization"] == "Bearer test_access_token"

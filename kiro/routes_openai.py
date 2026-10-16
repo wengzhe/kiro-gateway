@@ -34,6 +34,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from loguru import logger
 
+from kiro.client_profiles import KiroOperation
 from kiro.config import (
     PROXY_API_KEY,
     APP_VERSION,
@@ -337,6 +338,9 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
             
+            # Match chat payload origin to the client profile (KIRO_CLI / AI_EDITOR)
+            auth_manager.client_profile.apply_payload_origin(kiro_payload)
+            
             # Log Kiro payload
             try:
                 kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
@@ -346,7 +350,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 logger.warning(f"Failed to log Kiro request: {e}")
             
             # Create HTTP client
-            url = f"{auth_manager.api_host}/generateAssistantResponse"
+            url = auth_manager.operation_url(KiroOperation.GENERATE_ASSISTANT_RESPONSE)
             logger.debug(f"Kiro API URL: {url} (account: {account.id})")
             
             if request_data.stream:
@@ -586,6 +590,9 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     
+    # Match chat payload origin to the client profile (KIRO_CLI / AI_EDITOR)
+    auth_manager.client_profile.apply_payload_origin(kiro_payload)
+    
     # Log Kiro payload
     try:
         kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
@@ -597,7 +604,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
     # Create HTTP client with retry logic
     # For streaming: use per-request client to avoid CLOSE_WAIT leak on VPN disconnect (issue #54)
     # For non-streaming: use shared client for connection pooling
-    url = f"{auth_manager.api_host}/generateAssistantResponse"
+    url = auth_manager.operation_url(KiroOperation.GENERATE_ASSISTANT_RESPONSE)
     logger.debug(f"Kiro API URL: {url}")
     
     if request_data.stream:

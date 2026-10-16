@@ -184,6 +184,14 @@ KIRO_API_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 # Host for Q API (ListAvailableModels)
 KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 
+# Client fingerprint profile (see kiro/client_profiles.py)
+# Controls the wire format of Kiro chat/model-list calls: host, path, x-amz-target and User-Agent.
+# - "auto" (default): match the credential source (kiro-cli SQLite -> cli, Kiro IDE JSON -> ide)
+# - "cli": kiro-cli 2.2.2 (q.{region}.amazonaws.com, aws-sdk-rust user agent)
+# - "ide": Kiro IDE 1.3.11 (runtime/management.{region}.kiro.dev, aws-sdk-js user agent)
+# Can be overridden per account with "client_profile" in credentials.json.
+KIRO_CLIENT_PROFILE: str = os.getenv("KIRO_CLIENT_PROFILE", "auto").strip().lower() or "auto"
+
 # ==================================================================================================
 # Token Settings
 # ==================================================================================================

@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 
 from kiro.auth import KiroAuthManager, AuthType
+from kiro.client_profiles import KiroOperation
 from kiro.config import TOKEN_REFRESH_THRESHOLD, get_aws_sso_oidc_url
 
 
@@ -4251,3 +4252,227 @@ class TestAPIRegionPriorityHierarchy:
         print(f"Result: api_host={manager5._api_host}")
         assert "ap-south-1" in manager5._api_host
 
+
+
+# =============================================================================
+# Tests for client profile selection (KIRO_CLIENT_PROFILE)
+# =============================================================================
+
+class TestKiroAuthManagerClientProfile:
+    """
+    Tests for client fingerprint profile resolution in KiroAuthManager.
+
+    "auto" must follow the credential source, explicit values must win,
+    and invalid values must fail at construction time.
+    """
+
+    @staticmethod
+    def _write_json(tmp_path, name: str, data: dict) -> str:
+        path = tmp_path / name
+        path.write_text(json.dumps(data))
+        return str(path)
+
+    def test_refresh_token_auto_resolves_ide(self):
+        """
+        What it does: Builds manager from a plain refresh token with default config.
+        Purpose: Legacy refresh-token setups keep the IDE fingerprint.
+        """
+        with patch("kiro.auth.KIRO_CLIENT_PROFILE", "auto"):
+            manager = KiroAuthManager(refresh_token="rt")
+        assert manager.client_profile.name.value == "ide"
+
+    def test_sqlite_auto_resolves_cli(self, temp_sqlite_db):
+        """
+        What it does: Builds manager from kiro-cli SQLite with auto.
+        Purpose: kiro-cli tokens use kiro-cli wire format.
+        """
+        with patch("kiro.auth.KIRO_CLIENT_PROFILE", "auto"):
+            manager = KiroAuthManager(sqlite_db=temp_sqlite_db)
+        assert manager.client_profile.name.value == "cli"
+
+    def test_kiro_desktop_json_auto_resolves_ide(self, temp_creds_file):
+        """
+        What it does: Builds manager from a Kiro IDE (social) JSON file with auto.
+        Purpose: IDE credentials keep the IDE fingerprint.
+        """
+        with patch("kiro.auth.KIRO_CLIENT_PROFILE", "auto"):
+            manager = KiroAuthManager(creds_file=temp_creds_file)
+        assert manager.client_profile.name.value == "ide"
+
+    def test_raw_aws_sso_cache_json_auto_resolves_cli(self, temp_aws_sso_creds_file):
+        """
+        What it does: Builds manager from a raw AWS SSO cache file (clientId/clientSecret inline).
+        Purpose: These files come from kiro-cli logins, so auto picks cli.
+        """
+        with patch("kiro.auth.KIRO_CLIENT_PROFILE", "auto"):
+            manager = KiroAuthManager(creds_file=temp_aws_sso_creds_file)
+        assert manager.auth_type == AuthType.AWS_SSO_OIDC
+        assert manager.client_profile.name.value == "cli"
+
+    def test_enterprise_ide_json_auto_resolves_ide_despite_oidc(self, tmp_path, monkeypatch):
+        """
+        What it does: Builds manager from Enterprise IDE JSON (clientIdHash + device registration).
+        Purpose: Enterprise IDE uses OIDC auth but is still the IDE client - auth type alone
+        must not decide the profile.
+        """
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        cache = tmp_path / ".aws" / "sso" / "cache"
+        cache.mkdir(parents=True)
+        (cache / "hash123.json").write_text(json.dumps({"clientId": "cid", "clientSecret": "csecret"}))
+        creds = self._write_json(tmp_path, "kiro-auth-token.json", {
+            "accessToken": "a", "refreshToken": "r", "expiresAt": "2099-01-01T00:00:00.000Z",
+            "region": "us-east-1", "clientIdHash": "hash123", "authMethod": "IdC", "provider": "Enterprise",
+        })
+        with patch("kiro.auth.KIRO_CLIENT_PROFILE", "auto"):
+            manager = KiroAuthManager(creds_file=creds)
+        assert manager.auth_type == AuthType.AWS_SSO_OIDC
+        assert manager.client_profile.name.value == "ide"
+
+    @pytest.mark.parametrize("marker", [{"authMethod": "social"}, {"provider": "Google"}, {"clientIdHash": "x"}])
+    def test_ide_markers_win_over_inline_client_credentials(self, tmp_path, marker):
+        """
+        What it does: JSON with inline clientId/clientSecret plus an IDE marker.
+        Purpose: Any Kiro IDE marker identifies the IDE client.
+        """
+        creds = self._write_json(tmp_path, "c.json", {
+            "refreshToken": "r", "clientId": "cid", "clientSecret": "cs", **marker,
+        })
+        with patch("kiro.auth.KIRO_CLIENT_PROFILE", "auto"):
+            manager = KiroAuthManager(creds_file=creds)
+        assert manager.client_profile.name.value == "ide"
+
+    def test_missing_json_file_auto_falls_back_to_cli(self, tmp_path):
+        """
+        What it does: Points to a JSON file that does not exist.
+        Purpose: Construction must not crash; without IDE markers the file is not treated as IDE.
+        """
+        with patch("kiro.auth.KIRO_CLIENT_PROFILE", "auto"):
+            manager = KiroAuthManager(creds_file=str(tmp_path / "missing.json"))
+        assert manager.client_profile.name.value == "cli"
+
+    @pytest.mark.parametrize("value, expected", [("cli", "cli"), ("ide", "ide"), ("CLI", "cli")])
+    def test_global_config_overrides_auto(self, temp_sqlite_db, value, expected):
+        """
+        What it does: Sets KIRO_CLIENT_PROFILE explicitly.
+        Purpose: Global setting overrides source detection.
+        """
+        with patch("kiro.auth.KIRO_CLIENT_PROFILE", value):
+            manager = KiroAuthManager(sqlite_db=temp_sqlite_db)
+        assert manager.client_profile.name.value == expected
+
+    def test_per_account_parameter_overrides_global(self, temp_sqlite_db):
+        """
+        What it does: Passes client_profile while global says cli.
+        Purpose: credentials.json per-account setting has highest priority.
+        """
+        with patch("kiro.auth.KIRO_CLIENT_PROFILE", "cli"):
+            manager = KiroAuthManager(sqlite_db=temp_sqlite_db, client_profile="ide")
+        assert manager.client_profile.name.value == "ide"
+
+    def test_empty_per_account_parameter_means_auto(self, temp_sqlite_db):
+        """
+        What it does: Passes client_profile="" (empty string in credentials.json).
+        Purpose: Empty explicit value means auto, not "use global".
+        """
+        with patch("kiro.auth.KIRO_CLIENT_PROFILE", "ide"):
+            manager = KiroAuthManager(sqlite_db=temp_sqlite_db, client_profile="")
+        assert manager.client_profile.name.value == "cli"
+
+    @pytest.mark.parametrize("bad", ["desktop", "kiro-cli", "123"])
+    def test_invalid_per_account_value_raises(self, bad):
+        """
+        What it does: Passes an invalid client_profile.
+        Purpose: Misconfiguration fails at init with a clear error, not at request time.
+        """
+        with pytest.raises(ValueError, match="Invalid client profile"):
+            KiroAuthManager(refresh_token="rt", client_profile=bad)
+
+    def test_invalid_global_value_raises(self):
+        """
+        What it does: Sets an invalid KIRO_CLIENT_PROFILE.
+        Purpose: Global misconfiguration is not silently ignored.
+        """
+        with patch("kiro.auth.KIRO_CLIENT_PROFILE", "nope"):
+            with pytest.raises(ValueError, match="KIRO_CLIENT_PROFILE"):
+                KiroAuthManager(refresh_token="rt")
+
+
+class TestIsKiroIdeCredentials:
+    """Tests for _is_kiro_ide_credentials() helper."""
+
+    @pytest.mark.parametrize("data, expected", [
+        ({"refreshToken": "r"}, True),
+        ({}, True),
+        ({"clientId": "c", "clientSecret": "s"}, False),
+        ({"clientId": "c"}, True),
+        ({"clientSecret": "s"}, True),
+        ({"clientId": "c", "clientSecret": "s", "authMethod": "IdC"}, True),
+        ({"clientIdHash": "h"}, True),
+        ({"provider": "Enterprise"}, True),
+    ])
+    def test_detection_matrix(self, data, expected):
+        """
+        What it does: Evaluates detection across marker combinations.
+        Purpose: Only raw SSO cache (full inline client creds, no IDE markers) is non-IDE.
+        """
+        from kiro.auth import _is_kiro_ide_credentials
+        assert _is_kiro_ide_credentials(data) is expected
+
+
+class TestRegionFromProfileArn:
+    """Tests for _region_from_profile_arn() and ARN-based API region precedence."""
+
+    @pytest.mark.parametrize("arn, expected", [
+        ("arn:aws:codewhisperer:us-east-1:123456789012:profile/X", "us-east-1"),
+        ("arn:aws:codewhisperer:eu-central-1:1:profile/X", "eu-central-1"),
+        ("arn:aws:codewhisperer:us-gov-west-1:1:profile/X", "us-gov-west-1"),
+        ("arn:aws:codewhisperer::1:profile/X", None),
+        ("arn:aws:codewhisperer:US-EAST-1:1:profile/X", None),
+        ("arn:aws:codewhisperer:us-east-1", None),
+        ("not-an-arn:aws:codewhisperer:us-east-1:1:profile/X", None),
+        ("garbage", None),
+        ("", None),
+        (None, None),
+    ])
+    def test_parsing(self, arn, expected):
+        """
+        What it does: Parses valid and malformed ARNs.
+        Purpose: Only well-formed ARNs may influence the API host.
+        """
+        from kiro.auth import _region_from_profile_arn
+        assert _region_from_profile_arn(arn) == expected
+
+    def test_arn_region_beats_json_sso_region(self, tmp_path):
+        """
+        What it does: JSON says region ap-southeast-1 (SSO), ARN says us-east-1.
+        Purpose: Real setup (IdC in Singapore, Kiro profile in us-east-1) must call us-east-1 hosts.
+        """
+        creds = tmp_path / "kiro-auth-token.json"
+        creds.write_text(json.dumps({"refreshToken": "r", "region": "ap-southeast-1", "authMethod": "IdC"}))
+        manager = KiroAuthManager(
+            creds_file=str(creds), profile_arn="arn:aws:codewhisperer:us-east-1:1:profile/X", client_profile="ide",
+        )
+        assert manager.api_region == "us-east-1"
+        assert manager.operation_url(KiroOperation.GENERATE_ASSISTANT_RESPONSE) == "https://runtime.us-east-1.kiro.dev/"
+        assert manager.operation_url(KiroOperation.LIST_AVAILABLE_MODELS) == "https://management.us-east-1.kiro.dev/"
+
+    def test_explicit_api_region_beats_arn(self):
+        """
+        What it does: Passes api_region together with an ARN in another region.
+        Purpose: Explicit per-account override keeps highest priority.
+        """
+        manager = KiroAuthManager(
+            refresh_token="r", profile_arn="arn:aws:codewhisperer:us-east-1:1:profile/X",
+            api_region="eu-central-1", client_profile="cli",
+        )
+        assert manager.operation_url(KiroOperation.GENERATE_ASSISTANT_RESPONSE) == "https://q.eu-central-1.amazonaws.com/"
+
+    def test_malformed_arn_keeps_json_region(self, tmp_path):
+        """
+        What it does: JSON region with a malformed ARN.
+        Purpose: Bad ARNs must not break region detection.
+        """
+        creds = tmp_path / "c.json"
+        creds.write_text(json.dumps({"refreshToken": "r", "region": "eu-central-1", "authMethod": "social"}))
+        manager = KiroAuthManager(creds_file=str(creds), profile_arn="garbage", client_profile="ide")
+        assert manager.api_region == "eu-central-1"

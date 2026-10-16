@@ -1300,3 +1300,165 @@ class TestFormatDuration:
         """Test formatting days."""
         assert _format_duration(86400) == "1d"
         assert _format_duration(172800) == "2d"
+
+
+# =============================================================================
+# Tests for client profile integration (ListAvailableModels + per-account profile)
+# =============================================================================
+
+class TestBuildListModelsRequest:
+    """Tests for _build_list_models_request() helper."""
+
+    ARN = "arn:aws:codewhisperer:us-east-1:123456789:profile/test"
+
+    def _manager(self, profile: str, auth_type: AuthType, arn, region: str = "us-east-1"):
+        from kiro.client_profiles import PROFILES, ClientProfileName
+        manager = Mock()
+        manager.client_profile = PROFILES[ClientProfileName(profile)]
+        manager.auth_type = auth_type
+        manager.profile_arn = arn
+        manager.api_region = region
+        return manager
+
+    @pytest.mark.parametrize("auth_type", list(AuthType))
+    def test_cli_matches_kiro_cli(self, auth_type):
+        """
+        What it does: Builds CLI request for both auth types.
+        Purpose: kiro-cli POSTs to q host with args in query AND body.
+        """
+        from kiro.account_manager import _build_list_models_request
+        spec = _build_list_models_request(self._manager("cli", auth_type, self.ARN))
+        assert (spec.method, spec.url) == ("POST", "https://q.us-east-1.amazonaws.com/")
+        assert spec.params == spec.json_data == {"origin": "KIRO_CLI", "profileArn": self.ARN}
+
+    @pytest.mark.parametrize("auth_type", list(AuthType))
+    def test_ide_matches_kiro_ide(self, auth_type):
+        """
+        What it does: Builds IDE request for both auth types.
+        Purpose: Kiro IDE POSTs to management host with args in body only.
+        """
+        from kiro.account_manager import _build_list_models_request
+        spec = _build_list_models_request(self._manager("ide", auth_type, self.ARN))
+        assert (spec.method, spec.url, spec.params) == ("POST", "https://management.us-east-1.kiro.dev/", None)
+        assert spec.json_data == {"origin": "AI_EDITOR", "profileArn": self.ARN}
+
+    def test_uses_account_api_region(self):
+        """
+        What it does: Builds request for an eu-central-1 account.
+        Purpose: Host region must come from the account, not a global default.
+        """
+        from kiro.account_manager import _build_list_models_request
+        spec = _build_list_models_request(self._manager("ide", AuthType.AWS_SSO_OIDC, self.ARN, "eu-central-1"))
+        assert spec.url == "https://management.eu-central-1.kiro.dev/"
+
+    @pytest.mark.parametrize("profile", ["cli", "ide"])
+    def test_missing_profile_arn_never_sent(self, profile):
+        """
+        What it does: Builds requests with no profile ARN.
+        Purpose: Never send profileArn=None.
+        """
+        from kiro.account_manager import _build_list_models_request
+        spec = _build_list_models_request(self._manager(profile, AuthType.KIRO_DESKTOP, None))
+        assert "profileArn" not in spec.json_data
+        assert spec.params is None or "profileArn" not in spec.params
+
+
+class TestAccountManagerClientProfileIntegration:
+    """Tests that AccountManager wires client profiles into account init and model refresh."""
+
+    @staticmethod
+    async def _init(tmp_path, entry_extra: dict):
+        test_json = tmp_path / "kiro-auth-token.json"
+        test_json.write_text(json.dumps({
+            "refreshToken": "test_token", "accessToken": "test_access",
+            "expiresAt": "2099-01-01T00:00:00.000Z",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:123456789:profile/test",
+            "region": "us-east-1",
+        }))
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text(json.dumps([{"type": "json", "path": str(test_json), "enabled": True, **entry_extra}]))
+        manager = AccountManager(credentials_file=str(creds_file), state_file=str(tmp_path / "state.json"))
+        await manager.load_credentials()
+        account_id = str(test_json.resolve())
+
+        mock_client = AsyncMock()
+        response = Mock(status_code=200)
+        response.json.return_value = {"models": [{"modelId": "claude-sonnet-4.5"}]}
+        mock_client.request_with_retry = AsyncMock(return_value=response)
+        mock_client.close = AsyncMock()
+        with patch("kiro.account_manager.KiroHttpClient", return_value=mock_client), \
+             patch("kiro.auth.KIRO_CLIENT_PROFILE", "auto"):
+            ok = await manager._initialize_account(account_id)
+        return manager, account_id, ok, mock_client
+
+    @pytest.mark.asyncio
+    async def test_per_account_client_profile_applied(self, tmp_path):
+        """
+        What it does: Sets client_profile=cli in credentials.json for an IDE JSON account.
+        Purpose: Per-account override reaches KiroAuthManager.
+        """
+        manager, account_id, ok, _ = await self._init(tmp_path, {"client_profile": "cli"})
+        assert ok is True
+        assert manager._accounts[account_id].auth_manager.client_profile.name.value == "cli"
+
+    @pytest.mark.asyncio
+    async def test_no_per_account_value_uses_auto(self, tmp_path):
+        """
+        What it does: Omits client_profile in credentials.json.
+        Purpose: Falls back to global/auto (IDE JSON -> ide).
+        """
+        manager, account_id, ok, _ = await self._init(tmp_path, {})
+        assert ok is True
+        assert manager._accounts[account_id].auth_manager.client_profile.name.value == "ide"
+
+    @pytest.mark.asyncio
+    async def test_invalid_per_account_value_fails_account_init(self, tmp_path):
+        """
+        What it does: Sets an invalid client_profile for one account.
+        Purpose: Bad config disables that account instead of sending wrong traffic.
+        """
+        manager, account_id, ok, mock_client = await self._init(tmp_path, {"client_profile": "bogus"})
+        assert ok is False
+        mock_client.request_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("profile, url, has_query", [
+        ("cli", "https://q.us-east-1.amazonaws.com/", True),
+        ("ide", "https://management.us-east-1.kiro.dev/", False),
+    ])
+    async def test_init_list_models_uses_profile_format(self, tmp_path, profile, url, has_query):
+        """
+        What it does: Initializes an account per profile.
+        Purpose: ListAvailableModels is always fetched from the profile's host
+        (no static-list skip) with LIST operation headers.
+        """
+        from kiro.client_profiles import KiroOperation
+        _, _, ok, mock_client = await self._init(tmp_path, {"client_profile": profile})
+        assert ok is True
+        kwargs = mock_client.request_with_retry.call_args.kwargs
+        assert (kwargs["method"], kwargs["url"]) == ("POST", url)
+        assert kwargs["json_data"]["profileArn"] == "arn:aws:codewhisperer:us-east-1:123456789:profile/test"
+        assert (kwargs["params"] is not None) is has_query
+        assert kwargs["operation"] == KiroOperation.LIST_AVAILABLE_MODELS
+
+    @pytest.mark.asyncio
+    async def test_refresh_models_uses_profile_format(self, tmp_path):
+        """
+        What it does: Triggers TTL model refresh for a cli account.
+        Purpose: Refresh path must use the same profile format as init.
+        """
+        from kiro.client_profiles import KiroOperation
+        manager, account_id, ok, _ = await self._init(tmp_path, {"client_profile": "cli"})
+        assert ok is True
+        mock_client = AsyncMock()
+        response = Mock(status_code=200)
+        response.json.return_value = {"models": [{"modelId": "claude-sonnet-4.5"}]}
+        mock_client.request_with_retry = AsyncMock(return_value=response)
+        mock_client.close = AsyncMock()
+        with patch("kiro.account_manager.KiroHttpClient", return_value=mock_client):
+            await manager._refresh_account_models(account_id)
+        kwargs = mock_client.request_with_retry.call_args.kwargs
+        assert kwargs["method"] == "POST"
+        assert kwargs["url"] == "https://q.us-east-1.amazonaws.com/"
+        assert kwargs["json_data"]["origin"] == "KIRO_CLI"
+        assert kwargs["operation"] == KiroOperation.LIST_AVAILABLE_MODELS

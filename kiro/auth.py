@@ -47,7 +47,9 @@ from kiro.config import (
     get_kiro_api_host,
     get_kiro_q_host,
     get_aws_sso_oidc_url,
+    KIRO_CLIENT_PROFILE,
 )
+from kiro.client_profiles import ClientProfile, CredentialSource, KiroOperation, resolve_client_profile
 from kiro.utils import get_machine_fingerprint
 
 
@@ -63,6 +65,46 @@ SQLITE_REGISTRATION_KEYS = [
     "kirocli:odic:device-registration",
     "codewhisperer:odic:device-registration",
 ]
+
+
+_REGION_PATTERN = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d+$")
+
+
+def _region_from_profile_arn(profile_arn: Optional[str]) -> Optional[str]:
+    """
+    Extract the region from a CodeWhisperer profile ARN.
+    
+    Args:
+        profile_arn: ARN like "arn:aws:codewhisperer:us-east-1:123456789012:profile/ABC"
+    
+    Returns:
+        Region (e.g. "us-east-1", "us-gov-west-1") or None if missing/malformed
+    """
+    if not profile_arn:
+        return None
+    parts = profile_arn.split(":")
+    if len(parts) >= 6 and parts[0] == "arn" and _REGION_PATTERN.match(parts[3]):
+        return parts[3]
+    return None
+
+
+def _is_kiro_ide_credentials(data: dict) -> bool:
+    """
+    Check whether a JSON credentials file was written by Kiro IDE.
+    
+    Kiro IDE (kiro-auth-token.json) stores authMethod/provider and, for Enterprise,
+    clientIdHash pointing to a separate device registration file. Raw AWS SSO cache
+    files (used by kiro-cli) store clientId/clientSecret inline and none of these markers.
+    
+    Args:
+        data: Parsed JSON credentials
+    
+    Returns:
+        True if the file looks like Kiro IDE credentials
+    """
+    if any(key in data for key in ("authMethod", "provider", "clientIdHash")):
+        return True
+    return not ("clientId" in data and "clientSecret" in data)
 
 
 class AuthType(Enum):
@@ -100,6 +142,7 @@ class KiroAuthManager:
         q_host: Q API host for the current region
         fingerprint: Unique machine fingerprint
         auth_type: Type of authentication (KIRO_DESKTOP or AWS_SSO_OIDC)
+        client_profile: Client fingerprint profile used for Kiro API requests
     
     Example:
         >>> # Kiro Desktop Auth (default)
@@ -126,6 +169,7 @@ class KiroAuthManager:
         client_secret: Optional[str] = None,
         sqlite_db: Optional[str] = None,
         api_region: Optional[str] = None,
+        client_profile: Optional[str] = None,
     ):
         """
         Initializes the authentication manager.
@@ -141,6 +185,11 @@ class KiroAuthManager:
                        Default location: ~/.local/share/kiro-cli/data.sqlite3
             api_region: Q API region override (optional, per-account)
                        If not specified, uses auto-detection or falls back to region
+            client_profile: Client fingerprint profile "auto", "cli" or "ide" (optional, per-account)
+                       If not specified, uses KIRO_CLIENT_PROFILE (default "auto")
+        
+        Raises:
+            ValueError: If client_profile (or KIRO_CLIENT_PROFILE) is not auto/cli/ide
         """
         self._refresh_token = refresh_token
         self._profile_arn = profile_arn
@@ -165,6 +214,10 @@ class KiroAuthManager:
         # Track which SQLite key we loaded credentials from (for saving back to correct location)
         self._sqlite_token_key: Optional[str] = None
         
+        # True when the JSON credentials file was written by Kiro IDE (Social or Enterprise),
+        # False for raw AWS SSO cache files (used by kiro-cli). Drives "auto" client profile.
+        self._is_kiro_ide_file: bool = False
+        
         self._access_token: Optional[str] = None
         self._expires_at: Optional[datetime] = None
         self._lock = asyncio.Lock()
@@ -184,6 +237,27 @@ class KiroAuthManager:
         
         # Determine auth type based on available credentials
         self._detect_auth_type()
+        
+        # The profile ARN encodes the API region (arn:aws:codewhisperer:REGION:...).
+        # It wins over the JSON "region" field, which is the SSO region and may differ
+        # (e.g. IdC in ap-southeast-1, Kiro profile in us-east-1) - the IDE does the same.
+        arn_region = _region_from_profile_arn(self._profile_arn)
+        if arn_region and arn_region != self._detected_api_region:
+            logger.info(f"API region from profile ARN: {arn_region} (overrides {self._detected_api_region})")
+            self._detected_api_region = arn_region
+        
+        # Resolve client fingerprint profile (headers, paths) - validated early for clear errors
+        if sqlite_db:
+            credential_source = CredentialSource.SQLITE
+        elif creds_file:
+            credential_source = CredentialSource.JSON_FILE
+        else:
+            credential_source = CredentialSource.REFRESH_TOKEN
+        self._client_profile: ClientProfile = resolve_client_profile(
+            client_profile if client_profile is not None else KIRO_CLIENT_PROFILE,
+            credential_source,
+            self._is_kiro_ide_file,
+        )
         
         # Determine final API region with priority hierarchy:
         # 1. Explicit api_region parameter (per-account) - HIGHEST
@@ -219,6 +293,7 @@ class KiroAuthManager:
         # - API/Q hosts: use determined API region (for Q Developer API calls)
         sso_region_for_oidc = self._sso_region or region
         self._refresh_url = get_kiro_refresh_url(sso_region_for_oidc)
+        self._api_region = final_api_region
         self._api_host = get_kiro_api_host(final_api_region)
         self._q_host = get_kiro_q_host(final_api_region)
         
@@ -228,7 +303,10 @@ class KiroAuthManager:
             f"sso_region={sso_region_for_oidc}, "
             f"api_region={final_api_region}, "
             f"api_host={self._api_host}, "
-            f"q_host={self._q_host}"
+            f"q_host={self._q_host}, "
+            f"client_profile={self._client_profile.name.value}, "
+            f"chat_url={self.operation_url(KiroOperation.GENERATE_ASSISTANT_RESPONSE)}, "
+            f"models_url={self.operation_url(KiroOperation.LIST_AVAILABLE_MODELS)}"
         )
     
     def _detect_auth_type(self) -> None:
@@ -412,6 +490,10 @@ class KiroAuthManager:
             
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+            
+            # Kiro IDE writes authMethod/provider (and clientIdHash for Enterprise);
+            # raw AWS SSO cache files carry clientId/clientSecret inline instead.
+            self._is_kiro_ide_file = _is_kiro_ide_credentials(data)
             
             # Load common data from file
             if 'refreshToken' in data:
@@ -970,6 +1052,31 @@ class KiroAuthManager:
     def fingerprint(self) -> str:
         """Unique machine fingerprint."""
         return self._fingerprint
+    
+    @property
+    def api_region(self) -> str:
+        """Resolved API region used for Kiro API hosts."""
+        return self._api_region
+    
+    def operation_url(self, operation: KiroOperation) -> str:
+        """
+        Return the absolute URL of a Kiro operation for this account.
+        
+        Host and path come from the client profile (e.g. kiro-cli uses
+        q.{region}.amazonaws.com, Kiro IDE uses runtime/management.{region}.kiro.dev).
+        
+        Args:
+            operation: Kiro operation
+        
+        Returns:
+            Absolute URL
+        """
+        return self._client_profile.build_url(self._api_region, operation)
+    
+    @property
+    def client_profile(self) -> ClientProfile:
+        """Client fingerprint profile used to shape Kiro API requests."""
+        return self._client_profile
     
     @property
     def auth_type(self) -> AuthType:

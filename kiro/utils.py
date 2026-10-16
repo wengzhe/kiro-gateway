@@ -31,6 +31,8 @@ from typing import TYPE_CHECKING, List, Dict, Any
 
 from loguru import logger
 
+from kiro.client_profiles import KiroOperation
+
 if TYPE_CHECKING:
     from kiro.auth import KiroAuthManager
 
@@ -58,35 +60,37 @@ def get_machine_fingerprint() -> str:
         return hashlib.sha256(b"default-kiro-gateway").hexdigest()
 
 
-def get_kiro_headers(auth_manager: "KiroAuthManager", token: str) -> dict:
+def get_kiro_headers(
+    auth_manager: "KiroAuthManager",
+    token: str,
+    operation: KiroOperation = KiroOperation.GENERATE_ASSISTANT_RESPONSE,
+) -> dict:
     """
     Builds headers for Kiro API requests.
     
-    Includes all necessary headers for authentication and identification:
+    Headers come from the account's client profile (see kiro/client_profiles.py),
+    so Content-Type, x-amz-target and User-Agent always describe one consistent client:
     - Authorization with Bearer token
+    - Content-Type / x-amz-target matching the profile's wire protocol
     - User-Agent with fingerprint
     - AWS CodeWhisperer specific headers
     
     Args:
-        auth_manager: Authentication manager for obtaining fingerprint
+        auth_manager: Authentication manager (provides fingerprint and client profile)
         token: Access token for authorization
+        operation: Kiro operation the request is for (default: GenerateAssistantResponse)
     
     Returns:
         Dictionary with headers for HTTP request
     """
-    fingerprint = auth_manager.fingerprint
+    from kiro.auth import AuthType  # local import: kiro.auth imports this module
     
-    return {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/x-amz-json-1.0",
-        "x-amz-target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-        "User-Agent": f"aws-sdk-js/1.0.27 ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-0.7.45-{fingerprint}",
-        "x-amz-user-agent": f"aws-sdk-js/1.0.27 KiroIDE-0.7.45-{fingerprint}",
-        "x-amzn-codewhisperer-optout": "true",
-        "x-amzn-kiro-agent-mode": "vibe",
-        "amz-sdk-invocation-id": str(uuid.uuid4()),
-        "amz-sdk-request": "attempt=1; max=3",
-    }
+    return auth_manager.client_profile.build_headers(
+        token,
+        auth_manager.fingerprint,
+        operation,
+        is_sso_oidc=auth_manager.auth_type == AuthType.AWS_SSO_OIDC,
+    )
 
 
 def generate_completion_id() -> str:

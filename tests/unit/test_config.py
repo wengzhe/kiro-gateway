@@ -969,3 +969,28 @@ class TestAccountSystemConfig:
         
         print(f"Comparing STATE_SAVE_INTERVAL_SECONDS: Expected 10, Got {config_module.STATE_SAVE_INTERVAL_SECONDS}")
         assert config_module.STATE_SAVE_INTERVAL_SECONDS == 10
+
+class TestKiroClientProfileConfig:
+    """Tests for KIRO_CLIENT_PROFILE configuration."""
+
+    @pytest.mark.parametrize("raw, expected", [
+        (None, "auto"), ("", "auto"), ("   ", "auto"), ("CLI", "cli"), (" ide ", "ide"), ("bogus", "bogus"),
+    ])
+    def test_normalization(self, raw, expected, monkeypatch):
+        """
+        What it does: Reloads config with various KIRO_CLIENT_PROFILE values.
+        Purpose: Value is lowercased/trimmed, empty means auto; invalid values are kept
+        verbatim so validation can report them.
+        """
+        import importlib
+        import kiro.config as config_module
+        if raw is None:
+            monkeypatch.delenv("KIRO_CLIENT_PROFILE", raising=False)
+        else:
+            monkeypatch.setenv("KIRO_CLIENT_PROFILE", raw)
+        try:
+            importlib.reload(config_module)
+            assert config_module.KIRO_CLIENT_PROFILE == expected
+        finally:
+            monkeypatch.delenv("KIRO_CLIENT_PROFILE", raising=False)
+            importlib.reload(config_module)

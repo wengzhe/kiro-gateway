@@ -75,6 +75,7 @@ tests/
 │   ├── test_account_errors.py      # Account System error classification (FATAL vs RECOVERABLE)
 │   ├── test_account_manager.py     # AccountManager tests (failover, Circuit Breaker, sticky behavior, state persistence)
 │   ├── test_auth_manager.py        # KiroAuthManager tests (including api_region parameter priority)
+│   ├── test_client_profiles.py     # Client fingerprint profiles (cli/ide wire format, auto selection, KIRO_CLIENT_PROFILE)
 │   ├── test_cache.py               # ModelInfoCache tests (is_valid_model, add_hidden_model)
 │   ├── test_config.py              # Configuration tests (SERVER_HOST, SERVER_PORT, LOG_LEVEL, Account System constants)
 │   ├── test_converters_anthropic.py # Anthropic Messages API → Kiro converter tests
