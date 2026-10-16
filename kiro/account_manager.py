@@ -491,6 +491,9 @@ class AccountManager:
             # Get token to verify credentials
             token = await auth_manager.get_access_token()
             
+            # Kiro IDE credential files have no profileArn; discover it with this account's token
+            await auth_manager.discover_profile_arn()
+            
             # Fetch models list with retry + fallback (host/format from client profile)
             list_models_request = _build_list_models_request(auth_manager)
             

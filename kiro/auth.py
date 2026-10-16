@@ -69,6 +69,9 @@ SQLITE_REGISTRATION_KEYS = [
 
 _REGION_PATTERN = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d+$")
 
+# Regions Kiro IDE queries with ListAvailableProfiles (captured from its q-client.log)
+PROFILE_DISCOVERY_REGIONS = ("us-east-1", "eu-central-1")
+
 
 def _region_from_profile_arn(profile_arn: Optional[str]) -> Optional[str]:
     """
@@ -294,6 +297,7 @@ class KiroAuthManager:
         sso_region_for_oidc = self._sso_region or region
         self._refresh_url = get_kiro_refresh_url(sso_region_for_oidc)
         self._api_region = final_api_region
+        self._api_region_is_explicit = bool(api_region or api_region_override)
         self._api_host = get_kiro_api_host(final_api_region)
         self._q_host = get_kiro_q_host(final_api_region)
         
@@ -1031,6 +1035,77 @@ class KiroAuthManager:
     @property
     def profile_arn(self) -> Optional[str]:
         """AWS CodeWhisperer profile ARN."""
+        return self._profile_arn
+    
+    async def discover_profile_arn(self) -> Optional[str]:
+        """
+        Fill in a missing profile ARN by asking Kiro with this account's own token.
+        
+        Kiro IDE credential files carry no profileArn and only the SSO region, so
+        without discovery the gateway would send an empty ARN to a host in the SSO
+        region. Like Kiro IDE, ListAvailableProfiles is queried per region. Because
+        the call is authorized by this account's token, the result always belongs
+        to this account and cannot leak between accounts.
+        
+        The ARN is kept in memory only; credential files are never rewritten here.
+        
+        Returns:
+            The profile ARN in use (existing or discovered), or None if unavailable
+        
+        Raises:
+            ValueError: If several profiles are visible and none is configured
+        """
+        if self._profile_arn:
+            return self._profile_arn
+        
+        token = await self.get_access_token()
+        regions = [self._api_region] + [
+            r for r in PROFILE_DISCOVERY_REGIONS if r != self._api_region
+        ]
+        profiles = []
+        async with httpx.AsyncClient(timeout=15) as client:
+            for discovery_region in regions:
+                url = self._client_profile.build_url(
+                    discovery_region, KiroOperation.LIST_AVAILABLE_PROFILES
+                )
+                headers = self._client_profile.build_headers(
+                    token,
+                    self._fingerprint,
+                    KiroOperation.LIST_AVAILABLE_PROFILES,
+                    is_sso_oidc=self._auth_type == AuthType.AWS_SSO_OIDC,
+                )
+                try:
+                    response = await client.post(url, json={}, headers=headers)
+                except httpx.HTTPError as e:
+                    logger.debug(f"ListAvailableProfiles in {discovery_region} failed: {type(e).__name__}")
+                    continue
+                if response.status_code != 200:
+                    logger.debug(f"ListAvailableProfiles in {discovery_region} returned HTTP {response.status_code}")
+                    continue
+                for profile in response.json().get("profiles", []) or []:
+                    arn = profile.get("arn")
+                    if _region_from_profile_arn(arn) and arn not in profiles:
+                        profiles.append(arn)
+        
+        if not profiles:
+            logger.warning(
+                "No profile ARN configured and none discovered; requests will be sent without profileArn"
+            )
+            return None
+        if len(profiles) > 1:
+            raise ValueError(
+                f"Found {len(profiles)} Kiro profiles for this account; "
+                f"set 'profile_arn' in credentials.json to one of: {', '.join(profiles)}"
+            )
+        
+        self._profile_arn = profiles[0]
+        arn_region = _region_from_profile_arn(self._profile_arn)
+        logger.info(f"Discovered profile ARN in {arn_region}")
+        if arn_region != self._api_region and not self._api_region_is_explicit:
+            logger.info(f"API region: {arn_region} (from discovered profile ARN, was {self._api_region})")
+            self._api_region = arn_region
+            self._api_host = get_kiro_api_host(arn_region)
+            self._q_host = get_kiro_q_host(arn_region)
         return self._profile_arn
     
     @property

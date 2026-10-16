@@ -38,6 +38,16 @@ Kiro IDE 1.3.11 (aws-sdk-js, AWS JSON 1.0 RPC):
         x-amz-target: KiroControlPlaneBearerService.ListAvailableModels
     userInputMessage.origin = AI_EDITOR
 
+ListAvailableProfiles (verified live on 2026-10-16 with an Enterprise IdC token,
+empty JSON body, response {"profiles": [{"arn", "profileName"}]}):
+    cli: POST https://q.{region}.amazonaws.com/
+        x-amz-target: AmazonCodeWhispererService.ListAvailableProfiles
+    ide: POST https://management.{region}.kiro.dev/
+        x-amz-target: KiroControlPlaneBearerService.ListAvailableProfiles
+    Each call lists only the profiles of the queried region; Kiro IDE queries
+    us-east-1 and eu-central-1. Profile ARNs belong to the organization, so
+    accounts of one organization share the same ARN.
+
 A profile bundles host, path, method, content type, operation target, user agents
 and client-specific headers, so a request never mixes traits of two clients.
 
@@ -78,6 +88,7 @@ class KiroOperation(str, Enum):
 
     GENERATE_ASSISTANT_RESPONSE = "GenerateAssistantResponse"
     LIST_AVAILABLE_MODELS = "ListAvailableModels"
+    LIST_AVAILABLE_PROFILES = "ListAvailableProfiles"
 
 
 class CredentialSource(str, Enum):
@@ -370,6 +381,14 @@ CLI_PROFILE = ClientProfile(
             cli_metrics="m/F,C",
             args_in_query=True,
         ),
+        KiroOperation.LIST_AVAILABLE_PROFILES: OperationSpec(
+            host_template=CLI_HOST_TEMPLATE,
+            path="/",
+            target="AmazonCodeWhispererService.ListAvailableProfiles",
+            sdk_api="codewhispererruntime",
+            sdk_max_attempts=3,
+            cli_metrics="m/F,C",
+        ),
     },
     origin=CLI_ORIGIN,
 )
@@ -393,6 +412,13 @@ IDE_PROFILE = ClientProfile(
             host_template=IDE_MANAGEMENT_HOST_TEMPLATE,
             path="/",
             target="KiroControlPlaneBearerService.ListAvailableModels",
+            sdk_api="kirocontrolplanebearer",
+            sdk_max_attempts=3,
+        ),
+        KiroOperation.LIST_AVAILABLE_PROFILES: OperationSpec(
+            host_template=IDE_MANAGEMENT_HOST_TEMPLATE,
+            path="/",
+            target="KiroControlPlaneBearerService.ListAvailableProfiles",
             sdk_api="kirocontrolplanebearer",
             sdk_max_attempts=3,
         ),

@@ -4476,3 +4476,210 @@ class TestRegionFromProfileArn:
         creds.write_text(json.dumps({"refreshToken": "r", "region": "eu-central-1", "authMethod": "social"}))
         manager = KiroAuthManager(creds_file=str(creds), profile_arn="garbage", client_profile="ide")
         assert manager.api_region == "eu-central-1"
+
+
+class TestDiscoverProfileArn:
+    """Tests for profile ARN discovery via ListAvailableProfiles."""
+
+    ARN_US = "arn:aws:codewhisperer:us-east-1:111111111111:profile/AAAA"
+    ARN_EU = "arn:aws:codewhisperer:eu-central-1:222222222222:profile/BBBB"
+
+    @staticmethod
+    def _manager(tmp_path, region="ap-southeast-1", profile_arn=None, api_region=None):
+        import json as _json
+        creds = tmp_path / "kiro-auth-token.json"
+        creds.write_text(_json.dumps({
+            "accessToken": "ide-token",
+            "refreshToken": "ide-refresh",
+            "expiresAt": "2099-01-01T00:00:00.000Z",
+            "clientIdHash": "hash",
+            "authMethod": "IdC",
+            "provider": "Enterprise",
+            "region": region,
+        }))
+        return KiroAuthManager(
+            creds_file=str(creds), profile_arn=profile_arn, api_region=api_region
+        ), creds
+
+    @staticmethod
+    def _mock_client(responses_by_host):
+        calls = []
+
+        async def post(url, json=None, headers=None):
+            calls.append((url, headers))
+            for host, result in responses_by_host.items():
+                if host in url:
+                    if isinstance(result, Exception):
+                        raise result
+                    resp = Mock()
+                    resp.status_code = 200
+                    resp.json = Mock(return_value={"profiles": [{"arn": a, "profileName": "p"} for a in result]})
+                    return resp
+            resp = Mock()
+            resp.status_code = 400
+            resp.json = Mock(return_value={})
+            return resp
+
+        client = AsyncMock()
+        client.post = AsyncMock(side_effect=post)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=None)
+        return client, calls
+
+    @pytest.mark.asyncio
+    async def test_discovers_single_profile_and_moves_api_region(self, tmp_path):
+        """
+        What it does: Verifies a single discovered profile sets ARN and API region.
+        Purpose: Kiro IDE files only carry the SSO region (here ap-southeast-1),
+                 which has no Kiro API host.
+        """
+        print("Setup: IDE credentials without profileArn, SSO region ap-southeast-1...")
+        manager, _ = self._manager(tmp_path)
+        client, calls = self._mock_client({"us-east-1": [self.ARN_US], "eu-central-1": []})
+
+        print("Action: Discovering profile ARN...")
+        with patch('kiro.auth.httpx.AsyncClient', return_value=client):
+            arn = await manager.discover_profile_arn()
+
+        print(f"Result: arn={arn} api_region={manager.api_region}")
+        assert arn == self.ARN_US
+        assert manager.profile_arn == self.ARN_US
+        assert manager.api_region == "us-east-1"
+        assert "us-east-1" in manager.operation_url(KiroOperation.GENERATE_ASSISTANT_RESPONSE)
+
+    @pytest.mark.asyncio
+    async def test_uses_own_token_and_profile_wire_format(self, tmp_path):
+        """
+        What it does: Verifies discovery is authorized with this account's token.
+        Purpose: The token scopes the result to this account, so it cannot be mixed up.
+        """
+        manager, _ = self._manager(tmp_path)
+        client, calls = self._mock_client({"us-east-1": [self.ARN_US], "eu-central-1": []})
+
+        with patch('kiro.auth.httpx.AsyncClient', return_value=client):
+            await manager.discover_profile_arn()
+
+        print(f"Result: {len(calls)} calls")
+        for url, headers in calls:
+            assert headers["Authorization"] == "Bearer ide-token"
+            assert headers["x-amz-target"] == "KiroControlPlaneBearerService.ListAvailableProfiles"
+            assert url.startswith("https://management.")
+
+    @pytest.mark.asyncio
+    async def test_existing_arn_skips_discovery(self, tmp_path):
+        """
+        What it does: Verifies a configured ARN is kept and no request is made.
+        Purpose: Explicit configuration always wins.
+        """
+        manager, _ = self._manager(tmp_path, profile_arn=self.ARN_EU)
+        client, calls = self._mock_client({"us-east-1": [self.ARN_US]})
+
+        with patch('kiro.auth.httpx.AsyncClient', return_value=client):
+            arn = await manager.discover_profile_arn()
+
+        assert arn == self.ARN_EU
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_multiple_profiles_raise_instead_of_guessing(self, tmp_path):
+        """
+        What it does: Verifies several visible profiles raise ValueError.
+        Purpose: Picking the first one could select the wrong organization.
+        """
+        manager, _ = self._manager(tmp_path)
+        client, _ = self._mock_client({"us-east-1": [self.ARN_US], "eu-central-1": [self.ARN_EU]})
+
+        with patch('kiro.auth.httpx.AsyncClient', return_value=client):
+            with pytest.raises(ValueError, match="profile_arn"):
+                await manager.discover_profile_arn()
+        assert manager.profile_arn is None
+
+    @pytest.mark.asyncio
+    async def test_no_profiles_and_network_errors_return_none(self, tmp_path):
+        """
+        What it does: Verifies empty results and failed regions degrade to None.
+        Purpose: Discovery must never block an account that worked before.
+        """
+        manager, _ = self._manager(tmp_path)
+        client, _ = self._mock_client({
+            "ap-southeast-1": httpx.ConnectError("dns"),
+            "us-east-1": [],
+            "eu-central-1": [],
+        })
+
+        with patch('kiro.auth.httpx.AsyncClient', return_value=client):
+            arn = await manager.discover_profile_arn()
+
+        assert arn is None
+        assert manager.api_region == "ap-southeast-1"
+
+    @pytest.mark.asyncio
+    async def test_explicit_api_region_is_not_overridden(self, tmp_path):
+        """
+        What it does: Verifies a configured api_region survives discovery.
+        Purpose: Per-account api_region has the highest priority.
+        """
+        manager, _ = self._manager(tmp_path, api_region="eu-central-1")
+        client, _ = self._mock_client({"us-east-1": [self.ARN_US], "eu-central-1": []})
+
+        with patch('kiro.auth.httpx.AsyncClient', return_value=client):
+            await manager.discover_profile_arn()
+
+        assert manager.profile_arn == self.ARN_US
+        assert manager.api_region == "eu-central-1"
+
+    @pytest.mark.asyncio
+    async def test_credentials_file_is_not_rewritten(self, tmp_path):
+        """
+        What it does: Verifies discovery leaves the IDE credentials file untouched.
+        Purpose: The file belongs to Kiro IDE; the ARN stays in memory only.
+        """
+        manager, creds = self._manager(tmp_path)
+        before = creds.read_bytes()
+        client, _ = self._mock_client({"us-east-1": [self.ARN_US], "eu-central-1": []})
+
+        with patch('kiro.auth.httpx.AsyncClient', return_value=client):
+            await manager.discover_profile_arn()
+
+        assert creds.read_bytes() == before
+
+    @pytest.mark.asyncio
+    async def test_two_accounts_get_their_own_profiles(self, tmp_path):
+        """
+        What it does: Verifies two accounts from different organizations each keep
+                      the ARN returned for their own token.
+        Purpose: Regression test for cross-account ARN contamination.
+        """
+        print("Setup: Two IDE accounts with different tokens...")
+        import json as _json
+        dir_a, dir_b = tmp_path / "a", tmp_path / "b"
+        dir_a.mkdir(); dir_b.mkdir()
+        mgr_a, creds_a = self._manager(dir_a)
+        mgr_b, creds_b = self._manager(dir_b)
+        data_b = _json.loads(creds_b.read_text()); data_b["accessToken"] = "token-b"
+        creds_b.write_text(_json.dumps(data_b))
+        mgr_b, _ = KiroAuthManager(creds_file=str(creds_b)), None
+
+        by_token = {"Bearer ide-token": self.ARN_US, "Bearer token-b": self.ARN_EU}
+
+        async def post(url, json=None, headers=None):
+            resp = Mock()
+            resp.status_code = 200
+            arn = by_token[headers["Authorization"]]
+            region = arn.split(":")[3]
+            resp.json = Mock(return_value={"profiles": [{"arn": arn}] if region in url else []})
+            return resp
+
+        client = AsyncMock()
+        client.post = AsyncMock(side_effect=post)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=None)
+
+        print("Action: Discovering for both accounts...")
+        with patch('kiro.auth.httpx.AsyncClient', return_value=client):
+            await mgr_a.discover_profile_arn()
+            await mgr_b.discover_profile_arn()
+
+        print(f"Result: A={mgr_a.profile_arn} B={mgr_b.profile_arn}")
+        assert mgr_a.profile_arn == self.ARN_US and mgr_a.api_region == "us-east-1"
+        assert mgr_b.profile_arn == self.ARN_EU and mgr_b.api_region == "eu-central-1"

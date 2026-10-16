@@ -33,7 +33,10 @@ ARN = "arn:aws:codewhisperer:us-east-1:123456789012:profile/EXAMPLEPROFILE"
 FP = "0000000000000000000000000000000000000000000000000000000000000000"
 GAR = KiroOperation.GENERATE_ASSISTANT_RESPONSE
 LAM = KiroOperation.LIST_AVAILABLE_MODELS
+LAP = KiroOperation.LIST_AVAILABLE_PROFILES
 ALL_OPERATIONS = list(KiroOperation)
+# ListAvailableProfiles was verified live, not TLS-captured, so it is checked separately
+CAPTURED_OPERATIONS = [GAR, LAM]
 
 # Captured header sets (authorization, invocation id, host, length, connection removed).
 # OS-dependent parts use the Linux machine the capture was taken on.
@@ -97,7 +100,7 @@ def _normalized(headers):
 class TestMatchesCapturedTraffic:
     """Generated requests must equal the captured ones (host, path, headers)."""
 
-    @pytest.mark.parametrize("operation", ALL_OPERATIONS)
+    @pytest.mark.parametrize("operation", CAPTURED_OPERATIONS)
     def test_cli_headers_match_capture_except_optout(self, capture_machine, operation):
         """
         What it does: Compares every CLI header with the kiro-cli 2.2.2 capture.
@@ -107,7 +110,7 @@ class TestMatchesCapturedTraffic:
         assert generated.pop("x-amzn-codewhisperer-optout") == "true"
         assert generated == CAPTURED_CLI[operation]
 
-    @pytest.mark.parametrize("operation", ALL_OPERATIONS)
+    @pytest.mark.parametrize("operation", CAPTURED_OPERATIONS)
     def test_ide_headers_match_capture_for_sso_oidc(self, capture_machine, operation):
         """
         What it does: Compares every IDE header with the Kiro IDE 1.3.11 capture (IdC login).
@@ -116,7 +119,7 @@ class TestMatchesCapturedTraffic:
         generated = _normalized(IDE_PROFILE.build_headers("tok", FP, operation, is_sso_oidc=True))
         assert generated == CAPTURED_IDE[operation]
 
-    @pytest.mark.parametrize("operation", ALL_OPERATIONS)
+    @pytest.mark.parametrize("operation", CAPTURED_OPERATIONS)
     def test_ide_omits_token_type_for_non_oidc(self, capture_machine, operation):
         """
         What it does: Builds IDE headers for a Kiro Desktop (social) token.
@@ -454,3 +457,21 @@ class TestProfileRegistry:
         """
         with pytest.raises(dataclasses.FrozenInstanceError):
             CLI_PROFILE.origin = "X"  # type: ignore[misc]
+
+
+class TestListAvailableProfilesWireFormat:
+    """ListAvailableProfiles host and target, as verified live on 2026-10-16."""
+
+    @pytest.mark.parametrize("profile, url, target", [
+        (CLI_PROFILE, "https://q.us-east-1.amazonaws.com/", "AmazonCodeWhispererService.ListAvailableProfiles"),
+        (IDE_PROFILE, "https://management.us-east-1.kiro.dev/", "KiroControlPlaneBearerService.ListAvailableProfiles"),
+    ])
+    def test_url_and_target(self, profile, url, target):
+        """
+        What it does: Verifies the host and x-amz-target of ListAvailableProfiles.
+        Purpose: These are the only combinations that answered with HTTP 200.
+        """
+        assert profile.build_url("us-east-1", LAP) == url
+        headers = profile.build_headers("tok", FP, LAP, is_sso_oidc=True)
+        assert headers["x-amz-target"] == target
+        assert headers["Authorization"] == "Bearer tok"
