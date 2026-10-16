@@ -24,6 +24,7 @@ Contains functions for handling validation errors and other exceptions
 in a JSON-serialization compatible format.
 """
 
+import math
 from typing import Any, List, Dict
 
 from fastapi import Request
@@ -32,36 +33,37 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 
 
+def _to_json_safe(value: Any) -> Any:
+    """Recursively converts a value into something JSONResponse can serialize."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, dict):
+        return {str(k): _to_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_json_safe(v) for v in value]
+    return str(value)
+
+
 def sanitize_validation_errors(errors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Converts validation errors to JSON-serializable format.
     
-    Pydantic may include bytes objects in the 'input' field, which
-    are not JSON-serializable. This function converts them to strings.
+    Pydantic error dicts can carry values JSONResponse cannot encode: bytes in
+    'input', and exception objects in 'ctx' (e.g. ctx["error"] is the raw
+    ValueError raised by a model_validator). Left as-is these crash the 422
+    handler into a bare 500.
     
     Args:
         errors: List of validation errors from Pydantic
     
     Returns:
-        List of errors with bytes converted to strings
+        List of errors containing only JSON-serializable values
     """
-    sanitized = []
-    for error in errors:
-        sanitized_error = {}
-        for key, value in error.items():
-            if isinstance(value, bytes):
-                # Convert bytes to string
-                sanitized_error[key] = value.decode("utf-8", errors="replace")
-            elif isinstance(value, (list, tuple)):
-                # Recursively process lists
-                sanitized_error[key] = [
-                    v.decode("utf-8", errors="replace") if isinstance(v, bytes) else v
-                    for v in value
-                ]
-            else:
-                sanitized_error[key] = value
-        sanitized.append(sanitized_error)
-    return sanitized
+    return [_to_json_safe(error) for error in errors]
 
 
 async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:

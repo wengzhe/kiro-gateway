@@ -289,3 +289,96 @@ class TestValidationExceptionHandlerEdgeCases:
             
             body = json.loads(response.body.decode())
             assert "Привет мир" in body["body"]
+
+
+class TestSanitizeNonSerializableValues:
+    """Tests that values JSONResponse cannot encode are made serializable."""
+
+    def test_stringifies_exception_in_ctx(self):
+        """
+        What it does: Verifies an exception object nested in ctx becomes a string.
+        Purpose: Pydantic puts model_validator ValueErrors in ctx["error"], which
+                 previously crashed the 422 handler into a 500.
+        """
+        print("Setup: Error with ValueError in ctx...")
+        from kiro.exceptions import sanitize_validation_errors
+
+        errors = [
+            {
+                "type": "value_error",
+                "loc": ["body", "tools", 0],
+                "msg": "Value error, input_schema is required",
+                "input": {"name": "bad"},
+                "ctx": {"error": ValueError("input_schema is required")},
+            }
+        ]
+
+        print("Action: Sanitizing...")
+        result = sanitize_validation_errors(errors)
+
+        print(f"Result: ctx.error={result[0]['ctx']['error']!r}")
+        assert result[0]["ctx"]["error"] == "input_schema is required"
+
+    def test_decodes_deeply_nested_bytes(self):
+        """
+        What it does: Verifies bytes nested inside dicts and lists are decoded.
+        Purpose: The old implementation only handled one level of nesting.
+        """
+        print("Setup: Bytes nested two levels deep...")
+        from kiro.exceptions import sanitize_validation_errors
+
+        errors = [{"type": "x", "input": {"outer": [{"inner": b"deep"}]}}]
+
+        print("Action: Sanitizing...")
+        result = sanitize_validation_errors(errors)
+
+        print(f"Result: {result[0]['input']}")
+        assert result[0]["input"] == {"outer": [{"inner": "deep"}]}
+
+    def test_stringifies_non_finite_floats(self):
+        """
+        What it does: Verifies NaN and infinity become strings, finite floats stay.
+        Purpose: JSONResponse rejects non-finite floats.
+        """
+        print("Setup: Error with NaN, inf and a finite float...")
+        from kiro.exceptions import sanitize_validation_errors
+
+        errors = [{"type": "x", "input": [float("nan"), float("inf"), 1.5]}]
+
+        print("Action: Sanitizing...")
+        result = sanitize_validation_errors(errors)
+
+        print(f"Result: {result[0]['input']}")
+        assert result[0]["input"] == ["nan", "inf", 1.5]
+
+
+class TestValidationHandlerWithRealPydanticError:
+    """End-to-end test using a real Pydantic error from AnthropicTool."""
+
+    @pytest.mark.asyncio
+    async def test_tool_validator_error_returns_422_json(self):
+        """
+        What it does: Runs a real AnthropicTool validation failure through the handler.
+        Purpose: Regression test for the 500 caused by an unserializable ctx error.
+        """
+        import json
+        from pydantic import ValidationError
+        from kiro.exceptions import validation_exception_handler
+        from kiro.models_anthropic import AnthropicTool
+
+        print("Setup: Triggering a real validation error...")
+        with pytest.raises(ValidationError) as exc_info:
+            AnthropicTool(name="bad")
+        exc = RequestValidationError(exc_info.value.errors())
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.body = AsyncMock(return_value=b'{"tools":[{"name":"bad"}]}')
+
+        print("Action: Calling validation_exception_handler...")
+        with patch('kiro.debug_logger.debug_logger'):
+            response = await validation_exception_handler(mock_request, exc)
+
+        body = json.loads(response.body)
+        print(f"Result: status={response.status_code} detail={body['detail']}")
+        assert response.status_code == 422
+        assert "input_schema" in json.dumps(body["detail"])
