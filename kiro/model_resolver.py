@@ -89,6 +89,7 @@ def normalize_model_name(name: str) -> str:
     Normalize client model name to Kiro format.
     
     Transformations applied:
+    0. ppio/pa/claude-opus-4-8 → claude-opus-4.8 (strip vendor path prefix, then normalize)
     1. claude-haiku-4-5 → claude-haiku-4.5 (dash to dot for minor version)
     2. claude-haiku-4-5-20251001 → claude-haiku-4.5 (strip date suffix)
     3. claude-haiku-4-5-latest → claude-haiku-4.5 (strip 'latest' suffix)
@@ -127,6 +128,15 @@ def normalize_model_name(name: str) -> str:
     """
     if not name:
         return name
+
+    # No Kiro model ID contains "/", so a path-style name is a vendor-namespaced
+    # ID (e.g. a Mify "ppio/pa/..." name configured under the wrong provider).
+    # Keep only the last segment; Kiro still decides whether that is valid.
+    if "/" in name:
+        last_segment = name.rsplit("/", 1)[-1]
+        if last_segment:
+            logger.debug(f"Stripped vendor prefix from model name: '{name}' -> '{last_segment}'")
+            name = last_segment
 
     # Strip context window suffix (e.g., [1m], [200k]) — client-side indicator, not a model ID
     name = re.sub(r'\[\d+[mk]\]$', '', name, flags=re.IGNORECASE)

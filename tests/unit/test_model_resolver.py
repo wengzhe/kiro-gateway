@@ -1738,3 +1738,44 @@ class TestAliasSystemSecurity:
         print(f"Received suggestions: {suggestions}")
         # This is expected behavior - alias name doesn't contain family
         assert len(suggestions) > 0
+
+
+class TestVendorPrefixStripping:
+    """Tests that vendor path prefixes are removed before normalization."""
+
+    def test_strips_prefix_and_normalizes(self):
+        """
+        What it does: Verifies a Mify-style name maps to the Kiro model ID.
+        Purpose: Guards against a vendor-namespaced ID configured under Kiro.
+        """
+        from kiro.model_resolver import normalize_model_name
+        print("Action: normalize 'ppio/pa/claude-opus-4-8'...")
+        result = normalize_model_name("ppio/pa/claude-opus-4-8")
+        print(f"Result: {result}")
+        assert result == "claude-opus-4.8"
+
+    def test_strips_prefix_for_any_family(self):
+        """
+        What it does: Verifies stripping is not limited to an allowlist of families.
+        Purpose: Kiro also serves gpt-/glm-/deepseek- models.
+        """
+        from kiro.model_resolver import normalize_model_name
+        assert normalize_model_name("azure_openai/gpt-5.6-sol") == "gpt-5.6-sol"
+        assert normalize_model_name("zhipuai/glm-5") == "glm-5"
+
+    def test_trailing_slash_leaves_name_unchanged(self):
+        """
+        What it does: Verifies an empty last segment does not erase the name.
+        Purpose: 'foo/' must not become an empty model ID.
+        """
+        from kiro.model_resolver import normalize_model_name
+        assert normalize_model_name("foo/") == "foo/"
+
+    def test_name_without_slash_is_untouched(self):
+        """
+        What it does: Verifies ordinary names follow the existing path.
+        Purpose: The common case must not change.
+        """
+        from kiro.model_resolver import normalize_model_name
+        assert normalize_model_name("claude-opus-4.8") == "claude-opus-4.8"
+        assert normalize_model_name("auto") == "auto"
