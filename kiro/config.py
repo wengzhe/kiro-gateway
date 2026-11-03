@@ -285,6 +285,7 @@ FALLBACK_MODELS: List[Dict[str, str]] = [
     {"modelId": "auto"},
     {"modelId": "claude-opus-5.5"},
     {"modelId": "claude-sonnet-5.5"},
+    {"modelId": "claude-haiku-5.5"},
     {"modelId": "claude-opus-5"},
     {"modelId": "claude-sonnet-5"},
     {"modelId": "claude-opus-4.8"},
@@ -350,6 +351,11 @@ NATIVE_EFFORT_MODELS: Dict[str, Dict[str, Any]] = {
         "schema": EFFORT_SCHEMA_CLAUDE,
         "values": ("low", "medium", "high", "xhigh", "max"),
         "default": "high",
+    },
+    "claude-haiku-5.5": {
+        "schema": EFFORT_SCHEMA_CLAUDE,
+        "values": ("low", "medium", "high", "xhigh", "max"),
+        "default": "medium",
     },
     "claude-opus-5": {
         "schema": EFFORT_SCHEMA_CLAUDE,
