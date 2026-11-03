@@ -475,12 +475,14 @@ LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 # ==================================================================================================
 
 # Timeout for waiting for the first token from the model (in seconds).
-# If the model doesn't respond within this time, the request will be cancelled and retried.
-# This helps handle "stuck" requests when the model takes too long to think.
-# Default: 60 seconds. High-effort reasoning models (opus-5, gpt-5.6-sol at xhigh/max)
-# routinely spend 20-40s before the first token, and a shorter window cancels healthy
-# requests. Set a lower value (e.g. 15-30) for more aggressive retry on fast models.
-FIRST_TOKEN_TIMEOUT: float = float(os.getenv("FIRST_TOKEN_TIMEOUT", "60"))
+# If the model doesn't respond within this time, the request is cancelled and retried.
+# Default: 0 = disabled. Kiro was measured sending nothing for 62s before a large tool
+# call that then completed normally, so elapsed silence does not prove a request is stuck,
+# and retrying discards that work. A stuck upstream is still caught by
+# STREAMING_READ_TIMEOUT. Set a positive value to opt back into first-token retry; it only
+# retries while nothing has reached the client, so Anthropic streams (message_start is sent
+# first) error out instead of retrying.
+FIRST_TOKEN_TIMEOUT: float = float(os.getenv("FIRST_TOKEN_TIMEOUT", "0"))
 
 # Read timeout for streaming responses (in seconds).
 # This is the maximum time to wait for data between chunks during streaming.
@@ -493,6 +495,15 @@ STREAMING_READ_TIMEOUT: float = float(os.getenv("STREAMING_READ_TIMEOUT", "300")
 # After exhausting all attempts, an error will be returned.
 # Default: 3 attempts
 FIRST_TOKEN_MAX_RETRIES: int = int(os.getenv("FIRST_TOKEN_MAX_RETRIES", "3"))
+
+# Interval (seconds) for keepalive frames on streaming responses (0 disables).
+# Kiro can send nothing for over a minute before its first byte, and the gateway does
+# not forward reasoning or partial tool input, so without keepalives clients with an
+# idle-read timeout (opencode chunkTimeout, 300s) abort and resend healthy requests.
+# OpenAI streams get an SSE comment, Anthropic streams a "ping" event.
+# Keepalives never hide a stuck upstream: STREAMING_READ_TIMEOUT still ends the
+# stream with an error when Kiro itself sends no bytes for that long.
+STREAM_KEEPALIVE_INTERVAL: float = float(os.getenv("STREAM_KEEPALIVE_INTERVAL", "20"))
 
 # ==================================================================================================
 # Debug Settings

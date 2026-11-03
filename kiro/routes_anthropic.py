@@ -35,7 +35,7 @@ from fastapi.security import APIKeyHeader
 from loguru import logger
 
 from kiro.client_profiles import KiroOperation
-from kiro.config import PROXY_API_KEY, PROFILE_ARN
+from kiro.config import PROXY_API_KEY, PROFILE_ARN, STREAM_KEEPALIVE_INTERVAL, STREAMING_READ_TIMEOUT
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
     AnthropicCountTokensRequest,
@@ -51,6 +51,13 @@ from kiro.streaming_anthropic import (
     stream_kiro_to_anthropic,
     collect_anthropic_response,
     stream_with_first_token_retry_anthropic,
+)
+from kiro.stream_liveness import (
+    ANTHROPIC_KEEPALIVE,
+    StreamTimings,
+    current_timings,
+    describe_stream_error,
+    with_idle_keepalive,
 )
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
@@ -432,12 +439,14 @@ async def messages(
             
             try:
                 # Make request to Kiro API
+                timings = StreamTimings("POST /v1/messages")
                 response = await http_client.request_with_retry(
                     "POST",
                     url,
                     kiro_payload,
                     stream=True
                 )
+                timings.upstream_headers_received()
                 
                 if response.status_code == 200:
                     # SUCCESS - report and return
@@ -446,6 +455,7 @@ async def messages(
                     if request_data.stream:
                         # Streaming mode
                         async def stream_wrapper():
+                            timings_token = None
                             streaming_error = None
                             client_disconnected = False
                             try:
@@ -454,15 +464,21 @@ async def messages(
                                         "POST", url, kiro_payload, stream=True
                                     )
                                 
-                                async for chunk in stream_with_first_token_retry_anthropic(
-                                    make_request=make_retry_request,
-                                    model=request_data.model,
-                                    model_cache=model_cache,
-                                    auth_manager=auth_manager,
-                                    initial_response=response,
-                                    request_messages=messages_for_tokenizer,
-                                    request_tools=tools_for_tokenizer,
-                                    request_system=system_for_tokenizer,
+                                timings_token = current_timings.set(timings)
+                                async for chunk in with_idle_keepalive(
+                                    stream_with_first_token_retry_anthropic(
+                                        make_request=make_retry_request,
+                                        model=request_data.model,
+                                        model_cache=model_cache,
+                                        auth_manager=auth_manager,
+                                        initial_response=response,
+                                        request_messages=messages_for_tokenizer,
+                                        request_tools=tools_for_tokenizer,
+                                        request_system=system_for_tokenizer,
+                                    ),
+                                    interval=STREAM_KEEPALIVE_INTERVAL,
+                                    heartbeat=ANTHROPIC_KEEPALIVE,
+                                    timings=timings,
                                 ):
                                     yield chunk
                             except GeneratorExit:
@@ -471,7 +487,7 @@ async def messages(
                             except Exception as e:
                                 streaming_error = e
                                 try:
-                                    error_event = f'event: error\ndata: {json.dumps({"type": "error", "error": {"type": "api_error", "message": str(e)}})}\n\n'
+                                    error_event = f'event: error\ndata: {json.dumps({"type": "error", "error": {"type": "api_error", "message": describe_stream_error(e, STREAMING_READ_TIMEOUT)}})}\n\n'
                                     yield error_event
                                 except Exception:
                                     pass
@@ -486,11 +502,15 @@ async def messages(
                                 else:
                                     logger.info(f"HTTP 200 - POST /v1/messages (streaming) - completed")
                                 
+                                outcome = 'error' if streaming_error else ('client disconnected' if client_disconnected else 'completed')
+                                logger.info(timings.summary(outcome))
                                 if debug_logger:
                                     if streaming_error:
                                         debug_logger.flush_on_error(500, str(streaming_error))
                                     else:
                                         debug_logger.discard_buffers()
+                                if timings_token is not None:
+                                    current_timings.reset(timings_token)
                         
                         return StreamingResponse(
                             stream_wrapper(),
@@ -753,12 +773,14 @@ async def messages(
         # Make request to Kiro API (for both streaming and non-streaming modes)
         # Important: we wait for Kiro response BEFORE returning StreamingResponse,
         # so that we can return proper HTTP error codes if Kiro fails
+        timings = StreamTimings("POST /v1/messages")
         response = await http_client.request_with_retry(
             "POST",
             url,
             kiro_payload,
             stream=True
         )
+        timings.upstream_headers_received()
         
         if response.status_code != 200:
             try:
@@ -806,6 +828,7 @@ async def messages(
         if request_data.stream:
             # Streaming mode with first token retry
             async def stream_wrapper():
+                timings_token = None
                 streaming_error = None
                 client_disconnected = False
                 try:
@@ -816,15 +839,21 @@ async def messages(
                         )
                     
                     # Use retry wrapper with initial response
-                    async for chunk in stream_with_first_token_retry_anthropic(
-                        make_request=make_retry_request,
-                        model=request_data.model,
-                        model_cache=model_cache,
-                        auth_manager=auth_manager,
-                        initial_response=response,
-                        request_messages=messages_for_tokenizer,
-                        request_tools=tools_for_tokenizer,
-                        request_system=system_for_tokenizer,
+                    timings_token = current_timings.set(timings)
+                    async for chunk in with_idle_keepalive(
+                        stream_with_first_token_retry_anthropic(
+                            make_request=make_retry_request,
+                            model=request_data.model,
+                            model_cache=model_cache,
+                            auth_manager=auth_manager,
+                            initial_response=response,
+                            request_messages=messages_for_tokenizer,
+                            request_tools=tools_for_tokenizer,
+                            request_system=system_for_tokenizer,
+                        ),
+                        interval=STREAM_KEEPALIVE_INTERVAL,
+                        heartbeat=ANTHROPIC_KEEPALIVE,
+                        timings=timings,
                     ):
                         yield chunk
                 except GeneratorExit:
@@ -834,7 +863,7 @@ async def messages(
                     streaming_error = e
                     # Send error event to client, then gracefully end the stream
                     try:
-                        error_event = f'event: error\ndata: {json.dumps({"type": "error", "error": {"type": "api_error", "message": str(e)}})}\n\n'
+                        error_event = f'event: error\ndata: {json.dumps({"type": "error", "error": {"type": "api_error", "message": describe_stream_error(e, STREAMING_READ_TIMEOUT)}})}\n\n'
                         yield error_event
                     except Exception:
                         pass
@@ -849,11 +878,15 @@ async def messages(
                     else:
                         logger.info(f"HTTP 200 - POST /v1/messages (streaming) - completed")
                     
+                    outcome = 'error' if streaming_error else ('client disconnected' if client_disconnected else 'completed')
+                    logger.info(timings.summary(outcome))
                     if debug_logger:
                         if streaming_error:
                             debug_logger.flush_on_error(500, str(streaming_error))
                         else:
                             debug_logger.discard_buffers()
+                    if timings_token is not None:
+                        current_timings.reset(timings_token)
             
             return StreamingResponse(
                 stream_wrapper(),

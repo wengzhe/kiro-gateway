@@ -39,6 +39,8 @@ from kiro.config import (
     PROXY_API_KEY,
     APP_VERSION,
     PROFILE_ARN,
+    STREAM_KEEPALIVE_INTERVAL,
+    STREAMING_READ_TIMEOUT,
 )
 from kiro.models_openai import (
     OpenAIModel,
@@ -50,6 +52,13 @@ from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
 from kiro.converters_openai import build_kiro_payload
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
+from kiro.stream_liveness import (
+    OPENAI_KEEPALIVE,
+    StreamTimings,
+    current_timings,
+    describe_stream_error,
+    with_idle_keepalive,
+)
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.session_continuation import extract_session_id, resolve_continuation
@@ -361,12 +370,14 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             
             try:
                 # Make request to Kiro API
+                timings = StreamTimings("POST /v1/chat/completions")
                 response = await http_client.request_with_retry(
                     "POST",
                     url,
                     kiro_payload,
                     stream=True
                 )
+                timings.upstream_headers_received()
                 
                 if response.status_code == 200:
                     # SUCCESS - report and return
@@ -379,6 +390,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     if request_data.stream:
                         # Streaming mode
                         async def stream_wrapper():
+                            timings_token = None
                             streaming_error = None
                             client_disconnected = False
                             try:
@@ -387,15 +399,21 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                         "POST", url, kiro_payload, stream=True
                                     )
                                 
-                                async for chunk in stream_with_first_token_retry(
-                                    make_request=make_retry_request,
-                                    client=http_client.client,
-                                    model=request_data.model,
-                                    model_cache=model_cache,
-                                    auth_manager=auth_manager,
-                                    initial_response=response,
-                                    request_messages=messages_for_tokenizer,
-                                    request_tools=tools_for_tokenizer
+                                timings_token = current_timings.set(timings)
+                                async for chunk in with_idle_keepalive(
+                                    stream_with_first_token_retry(
+                                        make_request=make_retry_request,
+                                        client=http_client.client,
+                                        model=request_data.model,
+                                        model_cache=model_cache,
+                                        auth_manager=auth_manager,
+                                        initial_response=response,
+                                        request_messages=messages_for_tokenizer,
+                                        request_tools=tools_for_tokenizer
+                                    ),
+                                    interval=STREAM_KEEPALIVE_INTERVAL,
+                                    heartbeat=OPENAI_KEEPALIVE,
+                                    timings=timings,
                                 ):
                                     yield chunk
                             except GeneratorExit:
@@ -403,11 +421,12 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                 logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
                             except Exception as e:
                                 streaming_error = e
+                                # An error chunk, not a bare [DONE]: clients treat [DONE] as a finished empty reply
+                                error_chunk = {"error": {"message": describe_stream_error(e, STREAMING_READ_TIMEOUT), "type": "server_error", "code": "upstream_stream_error"}}
                                 try:
-                                    yield "data: [DONE]\n\n"
+                                    yield f"data: {json.dumps(error_chunk)}\n\n"
                                 except Exception:
                                     pass
-                                raise
                             finally:
                                 await http_client.close()
                                 if streaming_error:
@@ -418,11 +437,15 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                     logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - client disconnected")
                                 else:
                                     logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - completed")
+                                outcome = 'error' if streaming_error else ('client disconnected' if client_disconnected else 'completed')
+                                logger.info(timings.summary(outcome))
                                 if debug_logger:
                                     if streaming_error:
                                         debug_logger.flush_on_error(500, str(streaming_error))
                                     else:
                                         debug_logger.discard_buffers()
+                                if timings_token is not None:
+                                    current_timings.reset(timings_token)
                         
                         return StreamingResponse(stream_wrapper(), media_type="text/event-stream")
                     
@@ -619,12 +642,14 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         # Make request to Kiro API (for both streaming and non-streaming modes)
         # Important: we wait for Kiro response BEFORE returning StreamingResponse,
         # so that 200 OK means Kiro accepted the request and started responding
+        timings = StreamTimings("POST /v1/chat/completions")
         response = await http_client.request_with_retry(
             "POST",
             url,
             kiro_payload,
             stream=True
         )
+        timings.upstream_headers_received()
         
         if response.status_code != 200:
             try:
@@ -677,6 +702,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         if request_data.stream:
             # Streaming mode with first token retry
             async def stream_wrapper():
+                timings_token = None
                 streaming_error = None
                 client_disconnected = False
                 try:
@@ -687,15 +713,21 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         )
                     
                     # Use retry wrapper with initial response
-                    async for chunk in stream_with_first_token_retry(
-                        make_request=make_retry_request,
-                        client=http_client.client,
-                        model=request_data.model,
-                        model_cache=model_cache,
-                        auth_manager=auth_manager,
-                        initial_response=response,
-                        request_messages=messages_for_tokenizer,
-                        request_tools=tools_for_tokenizer
+                    timings_token = current_timings.set(timings)
+                    async for chunk in with_idle_keepalive(
+                        stream_with_first_token_retry(
+                            make_request=make_retry_request,
+                            client=http_client.client,
+                            model=request_data.model,
+                            model_cache=model_cache,
+                            auth_manager=auth_manager,
+                            initial_response=response,
+                            request_messages=messages_for_tokenizer,
+                            request_tools=tools_for_tokenizer
+                        ),
+                        interval=STREAM_KEEPALIVE_INTERVAL,
+                        heartbeat=OPENAI_KEEPALIVE,
+                        timings=timings,
                     ):
                         yield chunk
                 except GeneratorExit:
@@ -704,13 +736,12 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
                 except Exception as e:
                     streaming_error = e
-                    # Try to send [DONE] to client before finishing
-                    # so client doesn't "hang" waiting for data
+                    # An error chunk, not a bare [DONE]: clients treat [DONE] as a finished empty reply
+                    error_chunk = {"error": {"message": describe_stream_error(e, STREAMING_READ_TIMEOUT), "type": "server_error", "code": "upstream_stream_error"}}
                     try:
-                        yield "data: [DONE]\n\n"
+                        yield f"data: {json.dumps(error_chunk)}\n\n"
                     except Exception:
                         pass  # Client already disconnected
-                    raise
                 finally:
                     await http_client.close()
                     # Log access log for streaming (success or error)
@@ -723,11 +754,15 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     else:
                         logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - completed")
                     # Write debug logs AFTER streaming completes
+                    outcome = 'error' if streaming_error else ('client disconnected' if client_disconnected else 'completed')
+                    logger.info(timings.summary(outcome))
                     if debug_logger:
                         if streaming_error:
                             debug_logger.flush_on_error(500, str(streaming_error))
                         else:
                             debug_logger.discard_buffers()
+                    if timings_token is not None:
+                        current_timings.reset(timings_token)
             
             return StreamingResponse(stream_wrapper(), media_type="text/event-stream")
         

@@ -14,6 +14,7 @@ For Anthropic API tests, see test_routes_anthropic.py.
 """
 
 import pytest
+import asyncio
 from unittest.mock import AsyncMock, Mock, patch, MagicMock
 from datetime import datetime, timezone
 import json
@@ -2069,3 +2070,98 @@ class TestClientProfileUrlOpenAI:
         _, call = self._send(test_client, valid_proxy_api_key, profile, False, False, monkeypatch)
         operation = call.kwargs.get("operation", KiroOperation.GENERATE_ASSISTANT_RESPONSE)
         assert operation == KiroOperation.GENERATE_ASSISTANT_RESPONSE
+
+
+# =============================================================================
+# Tests for streaming liveness (keepalives and upstream stalls)
+# =============================================================================
+
+class TestStreamingLivenessOpenAI:
+    """
+    Runs the real streaming route against a stubbed Kiro response and checks what
+    the client receives while Kiro is silent and when Kiro stalls.
+    """
+
+    @staticmethod
+    def _post(test_client, valid_proxy_api_key, monkeypatch, aiter_bytes, route="kiro.routes_openai",
+              path="/v1/chat/completions", body=None):
+        state = test_client.app.state
+        monkeypatch.setattr(state, "account_system", False)
+        monkeypatch.setattr(f"{route}.STREAM_KEEPALIVE_INTERVAL", 0.01)
+
+        response = MagicMock()
+        response.status_code = 200
+        response.aiter_bytes = aiter_bytes
+        response.aclose = AsyncMock()
+
+        with patch(f"{route}.KiroHttpClient") as mock_http_class:
+            mock_client = AsyncMock()
+            mock_client.request_with_retry = AsyncMock(return_value=response)
+            mock_client.close = AsyncMock()
+            mock_client.client = MagicMock()
+            mock_http_class.return_value = mock_client
+            return test_client.post(
+                path,
+                headers={"Authorization": f"Bearer {valid_proxy_api_key}", "x-api-key": valid_proxy_api_key,
+                         "anthropic-version": "2023-06-01"},
+                json=body or {"model": "claude-sonnet-4-5", "messages": [{"role": "user", "content": "Hi"}], "stream": True},
+            ).text
+
+    @staticmethod
+    def _stall_after_keepalive(route):
+        """Kiro sends nothing until the route has emitted a keepalive, then the read times out."""
+        import httpx
+        import kiro.stream_liveness as liveness
+
+        heartbeat_sent = asyncio.Event()
+        original = liveness.with_idle_keepalive
+
+        async def spy(source, interval, heartbeat, timings=None):
+            async for chunk in original(source, interval, heartbeat, timings):
+                if chunk == heartbeat:
+                    heartbeat_sent.set()
+                yield chunk
+
+        async def stalled():
+            await heartbeat_sent.wait()
+            raise httpx.ReadTimeout("no data")
+            yield b""
+
+        return spy, stalled
+
+    def test_keepalives_then_retryable_error_when_upstream_stalls(self, test_client, valid_proxy_api_key, monkeypatch):
+        """
+        What it does: Kiro sends nothing, then the upstream read times out.
+        Purpose: The client must get keepalives during the silence, then an error
+                 chunk (which opencode retries) instead of a bare [DONE] (which it
+                 treats as an empty finished reply).
+        """
+        spy, stalled = self._stall_after_keepalive("kiro.routes_openai")
+        monkeypatch.setattr("kiro.routes_openai.with_idle_keepalive", spy)
+
+        body = self._post(test_client, valid_proxy_api_key, monkeypatch, stalled)
+        print(f"Body: {body!r}")
+        assert ": keepalive\n\n" in body
+        assert '"code": "upstream_stream_error"' in body
+        assert "Upstream stalled: Kiro sent no data for" in body
+        assert "[DONE]" not in body
+
+    def test_anthropic_pings_then_error_event_when_upstream_stalls(self, test_client, valid_proxy_api_key, monkeypatch):
+        """
+        What it does: Same stall on the Anthropic route.
+        Purpose: Anthropic clients get ping events, then an error event naming the stall.
+        """
+        spy, stalled = self._stall_after_keepalive("kiro.routes_anthropic")
+        monkeypatch.setattr("kiro.routes_anthropic.with_idle_keepalive", spy)
+
+        body = self._post(
+            test_client, valid_proxy_api_key, monkeypatch, stalled,
+            route="kiro.routes_anthropic", path="/v1/messages",
+            body={"model": "claude-sonnet-4-5", "max_tokens": 100, "stream": True,
+                  "messages": [{"role": "user", "content": "Hi"}]},
+        )
+        print(f"Body: {body!r}")
+        assert body.count("event: message_start") == 1
+        assert "event: ping" in body
+        assert "event: error" in body
+        assert "Upstream stalled: Kiro sent no data for" in body

@@ -1832,3 +1832,71 @@ class TestStreamWithFirstTokenRetryCore:
         assert make_request_call_count == 1
         assert len(chunks) == 1
         print("✓ make_request called immediately when initial_response is None")
+
+class TestFirstTokenRetryCommittedOutput:
+    """Tests that a retry never follows output already sent to the client."""
+
+    @pytest.mark.asyncio
+    async def test_no_retry_after_output(self):
+        """
+        What it does: Processor yields one chunk, then raises FirstTokenTimeoutError.
+        Purpose: Retrying would append a second message (e.g. a second Anthropic
+                 message_start) to the same client stream.
+        """
+        calls = 0
+
+        async def make_request():
+            nonlocal calls
+            calls += 1
+            response = AsyncMock()
+            response.status_code = 200
+            return response
+
+        async def processor(response):
+            yield "event: message_start\n\n"
+            raise FirstTokenTimeoutError("late timeout")
+
+        chunks = []
+        with pytest.raises(FirstTokenTimeoutError):
+            async for chunk in stream_with_first_token_retry(
+                make_request=make_request, stream_processor=processor,
+                max_retries=3, first_token_timeout=30,
+            ):
+                chunks.append(chunk)
+
+        print(f"calls={calls} chunks={chunks}")
+        assert calls == 1
+        assert chunks == ["event: message_start\n\n"]
+
+
+class TestFirstTokenTimeoutDisabled:
+    """Tests that first_token_timeout <= 0 waits for the first chunk without a deadline."""
+
+    @pytest.mark.asyncio
+    async def test_zero_timeout_never_raises(self, mock_response):
+        """
+        What it does: Parses a stream whose first chunk arrives only after the test releases it.
+        Purpose: FIRST_TOKEN_TIMEOUT=0 must not abort slow but healthy requests.
+        """
+        release = asyncio.Event()
+
+        async def mock_aiter_bytes():
+            await release.wait()
+            yield b"A"
+
+        mock_response.aiter_bytes = mock_aiter_bytes
+        parser = MagicMock()
+        parser.get_tool_calls.return_value = []
+        parser.feed.side_effect = lambda chunk: [{"type": "content", "data": chunk.decode()}]
+
+        with patch('kiro.streaming_core.AwsEventStreamParser', return_value=parser):
+            with patch('kiro.streaming_core.FAKE_REASONING_ENABLED', False):
+                stream = parse_kiro_stream(mock_response, first_token_timeout=0)
+                first = asyncio.ensure_future(stream.__anext__())
+                await asyncio.sleep(0)
+                assert not first.done()
+                release.set()
+                async with asyncio.timeout(5):
+                    event = await first
+
+        assert event.content == "A"

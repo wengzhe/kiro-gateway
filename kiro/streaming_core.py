@@ -38,6 +38,7 @@ import httpx
 from loguru import logger
 
 from kiro.parsers import AwsEventStreamParser, parse_bracket_tool_calls, deduplicate_tool_calls
+from kiro.stream_liveness import current_timings, timed_byte_iterator
 from kiro.config import (
     FIRST_TOKEN_TIMEOUT,
     FIRST_TOKEN_MAX_RETRIES,
@@ -148,15 +149,18 @@ async def parse_kiro_stream(
     
     try:
         # Create iterator for reading bytes
-        byte_iterator = response.aiter_bytes()
+        byte_iterator = timed_byte_iterator(response)
         
-        # Wait for first chunk with timeout
+        # Wait for the first chunk; a non-positive timeout waits as long as the upstream read allows
         try:
-            logger.debug(f"Waiting for first token (timeout={first_token_timeout}s)...")
-            first_byte_chunk = await asyncio.wait_for(
-                byte_iterator.__anext__(),
-                timeout=first_token_timeout
-            )
+            if first_token_timeout > 0:
+                logger.debug(f"Waiting for first token (timeout={first_token_timeout}s)...")
+                first_byte_chunk = await asyncio.wait_for(
+                    byte_iterator.__anext__(),
+                    timeout=first_token_timeout
+                )
+            else:
+                first_byte_chunk = await byte_iterator.__anext__()
             logger.debug("First token received")
         except asyncio.TimeoutError:
             logger.warning(f"[FirstTokenTimeout] Model did not respond within {first_token_timeout}s")
@@ -418,13 +422,17 @@ async def stream_with_first_token_retry(
         ...     print(chunk)
     """
     last_error: Optional[Exception] = None
+    timings = current_timings.get()
     
     for attempt in range(max_retries):
         response: Optional[httpx.Response] = None
+        emitted = False
         try:
             # Make request
             if attempt > 0:
                 logger.warning(f"Retry attempt {attempt + 1}/{max_retries} after first token timeout")
+            if timings:
+                timings.attempt_started()
             
             # On first attempt, reuse initial_response if provided
             if attempt == 0 and initial_response is not None:
@@ -455,12 +463,21 @@ async def stream_with_first_token_retry(
             
             # Try to stream with first token timeout
             async for chunk in stream_processor(response):
+                emitted = True
                 yield chunk
             
             # Successfully completed - exit
             return
             
         except FirstTokenTimeoutError as e:
+            # A retry after output would send a second message to the same client stream
+            if emitted:
+                if response:
+                    try:
+                        await response.aclose()
+                    except Exception:
+                        pass
+                raise
             last_error = e
             logger.warning(
                 f"[FirstTokenTimeout] Attempt {attempt + 1}/{max_retries} failed - "
