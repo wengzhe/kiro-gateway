@@ -643,10 +643,13 @@ async def stream_kiro_to_anthropic(
         else:
             stop_reason = "end_turn"
         
-        # Send message_delta with stop_reason and usage
-        usage_payload = {
+        # message_start only carried a local estimate. Resend the context-usage-based
+        # input_tokens so Anthropic SDKs (which overwrite it from message_delta) see the real size.
+        usage_payload: Dict[str, Any] = {
             "output_tokens": output_tokens
         }
+        if context_usage_percentage is not None and prompt_source != "unknown":
+            usage_payload["input_tokens"] = input_tokens
         usage_payload.update(upstream_cache_usage)
 
         yield format_sse_event("message_delta", {

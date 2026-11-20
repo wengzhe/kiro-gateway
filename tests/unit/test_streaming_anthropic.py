@@ -1177,6 +1177,35 @@ class TestStreamingAnthropicContextUsage:
 
         message_start_event = next(e for e in events if "event: message_start" in e)
         assert '"input_tokens": 99' in message_start_event
+        message_delta_event = next(e for e in events if "event: message_delta" in e)
+        assert '"input_tokens"' not in message_delta_event
+
+    @pytest.mark.asyncio
+    async def test_message_delta_reports_input_tokens_from_context_usage(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Resends input_tokens computed from Kiro context usage in message_delta.
+        Goal: Clients that overwrite input_tokens from message_delta see the real context size, not the estimate.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Hello")
+            yield KiroEvent(type="context_usage", context_usage_percentage=50.0)
+
+        events = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                with patch('kiro.streaming_anthropic.estimate_request_tokens', return_value={"total_tokens": 99}):
+                    async for event in stream_kiro_to_anthropic(
+                        mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager,
+                        request_messages=[{"role": "user", "content": "hi"}]
+                    ):
+                        events.append(event)
+
+        message_start_event = next(e for e in events if "event: message_start" in e)
+        assert '"input_tokens": 99' in message_start_event
+
+        message_delta_event = next(e for e in events if "event: message_delta" in e)
+        usage = json.loads(message_delta_event.split("data: ", 1)[1])["usage"]
+        assert usage["input_tokens"] == 100000 - usage["output_tokens"]
 
     @pytest.mark.asyncio
     async def test_non_streaming_passes_upstream_cache_usage_fields(self, mock_response, mock_model_cache, mock_auth_manager):
