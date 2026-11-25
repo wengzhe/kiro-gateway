@@ -503,7 +503,7 @@ async def messages(
                                     logger.info(f"HTTP 200 - POST /v1/messages (streaming) - completed")
                                 
                                 outcome = 'error' if streaming_error else ('client disconnected' if client_disconnected else 'completed')
-                                logger.info(timings.summary(outcome))
+                                timings.log(outcome)
                                 if debug_logger:
                                     if streaming_error:
                                         debug_logger.flush_on_error(500, str(streaming_error))
@@ -879,7 +879,7 @@ async def messages(
                         logger.info(f"HTTP 200 - POST /v1/messages (streaming) - completed")
                     
                     outcome = 'error' if streaming_error else ('client disconnected' if client_disconnected else 'completed')
-                    logger.info(timings.summary(outcome))
+                    timings.log(outcome)
                     if debug_logger:
                         if streaming_error:
                             debug_logger.flush_on_error(500, str(streaming_error))

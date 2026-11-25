@@ -1485,3 +1485,30 @@ class TestStreamingOpenaiTruncationDetection:
         # Should extract "length" from streaming chunks
         assert result["choices"][0]["finish_reason"] == "length"
         print("✓ collect_stream_response extracts finish_reason correctly")
+
+class TestOpenAIContentFilteredRefusal:
+    """Tests that Kiro CONTENT_FILTERED becomes an OpenAI content_filter finish."""
+
+    @pytest.mark.asyncio
+    async def test_streaming_refusal_has_finish_reason_and_visible_text(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Streams a turn that ends with only a refusal event.
+        Goal: finish_reason is "content_filter" and the explanation is sent as content.
+        """
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="context_usage", context_usage_percentage=64.0)
+            yield KiroEvent(type="refusal", refusal={"category": "CYBER", "explanation": "Cannot continue."})
+
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                chunks = [c async for c in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                )]
+
+        data = [json.loads(c[6:]) for c in chunks if c.startswith("data: {")]
+        content = "".join(d["choices"][0]["delta"].get("content", "") for d in data if d.get("choices"))
+        finish = [d["choices"][0]["finish_reason"] for d in data if d.get("choices") and d["choices"][0].get("finish_reason")]
+        print(f"finish={finish} content={content!r}")
+        assert finish == ["content_filter"]
+        assert "CYBER" in content and "Cannot continue." in content

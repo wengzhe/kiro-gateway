@@ -1696,3 +1696,75 @@ class TestStreamingAnthropicTruncationDetection:
         # Should detect truncation and set max_tokens
         assert result["stop_reason"] == "max_tokens"
         print("✓ collect_anthropic_response detects truncation correctly")
+
+
+class TestAnthropicContentFilteredRefusal:
+    """Tests that Kiro CONTENT_FILTERED becomes an Anthropic refusal."""
+
+    REFUSAL = {"category": "CYBER", "explanation": "Cannot continue."}
+
+    @pytest.mark.asyncio
+    async def test_streaming_refusal_has_stop_reason_and_visible_text(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Streams a turn that ends with only a refusal event.
+        Goal: stop_reason is "refusal" (opencode shows a content-filter error) and the
+              explanation is visible, instead of an empty end_turn.
+        """
+        refusal = self.REFUSAL
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="context_usage", context_usage_percentage=64.0)
+            yield KiroEvent(type="refusal", refusal=refusal)
+
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            events = [e async for e in stream_kiro_to_anthropic(
+                mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+            )]
+
+        payloads = [json.loads(e.split("data: ", 1)[1]) for e in events]
+        deltas = [p for p in payloads if p["type"] == "message_delta"]
+        texts = "".join(p["delta"].get("text", "") for p in payloads if p["type"] == "content_block_delta")
+        starts = [p for p in payloads if p["type"] == "content_block_start"]
+        stops = [p for p in payloads if p["type"] == "content_block_stop"]
+        print(f"stop_reason={deltas[0]['delta']['stop_reason']} text={texts!r}")
+        assert deltas[0]["delta"]["stop_reason"] == "refusal"
+        assert "CYBER" in texts and "Cannot continue." in texts
+        assert len(starts) == 1 and len(stops) == 1
+
+    @pytest.mark.asyncio
+    async def test_streaming_refusal_after_partial_text_appends_notice(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Kiro streams some text, then the filter stops the turn.
+        Goal: The notice follows the partial text in the same block.
+        """
+        refusal = self.REFUSAL
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Partial answer")
+            yield KiroEvent(type="context_usage", context_usage_percentage=64.0)
+            yield KiroEvent(type="refusal", refusal=refusal)
+
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            events = [e async for e in stream_kiro_to_anthropic(
+                mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+            )]
+
+        payloads = [json.loads(e.split("data: ", 1)[1]) for e in events]
+        texts = "".join(p["delta"].get("text", "") for p in payloads if p["type"] == "content_block_delta")
+        assert texts.startswith("Partial answer\n\n")
+        assert [p for p in payloads if p["type"] == "message_delta"][0]["delta"]["stop_reason"] == "refusal"
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_refusal(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Collects a non-streaming response that Kiro's filter stopped.
+        Goal: stop_reason "refusal" with the explanation as text.
+        """
+        mock_result = StreamResult(content="", context_usage_percentage=64.0, refusal=self.REFUSAL)
+        with patch('kiro.streaming_anthropic.collect_stream_to_result', return_value=mock_result):
+            result = await collect_anthropic_response(
+                mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+            )
+        assert result["stop_reason"] == "refusal"
+        assert result["content"][0]["type"] == "text"
+        assert "CYBER" in result["content"][0]["text"]

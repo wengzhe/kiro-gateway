@@ -47,6 +47,9 @@ class StreamTimings:
         self.max_upstream_gap = 0.0
         self.attempts = 0
         self.keepalives = 0
+        self.stop_reason: Optional[str] = None
+        self.refusal_category: Optional[str] = None
+        self.output_events = 0
         self._last_upstream: Optional[float] = None
 
     def upstream_headers_received(self) -> None:
@@ -66,14 +69,33 @@ class StreamTimings:
         self._last_upstream = now
         self.upstream_chunks += 1
 
+    def output_event(self) -> None:
+        self.output_events += 1
+
+    @property
+    def empty_turn(self) -> bool:
+        """Kiro finished normally but sent no text, thinking or tool call to forward."""
+        return self.stop_reason is not None and self.output_events == 0
+
     def summary(self, outcome: str) -> str:
         fmt = lambda v: f"{v:.1f}s" if v is not None else "none"
         return (
             f"[StreamTimings] {self.label} {outcome}: total={time.monotonic() - self.started:.1f}s "
             f"upstream_headers={fmt(self.headers_at)} first_upstream_byte={fmt(self.first_upstream_byte)} "
             f"max_upstream_gap={self.max_upstream_gap:.1f}s upstream_chunks={self.upstream_chunks} "
-            f"attempts={self.attempts} keepalives={self.keepalives}"
+            f"attempts={self.attempts} keepalives={self.keepalives} "
+            f"stop_reason={self.stop_reason or 'none'} output_events={self.output_events}"
+            + (f" refusal={self.refusal_category}" if self.refusal_category else "")
         )
+
+    def log(self, outcome: str) -> None:
+        line = self.summary(outcome)
+        if self.refusal_category or self.stop_reason == "CONTENT_FILTERED":
+            logger.warning(f"{line} CONTENT_FILTERED: Kiro refused to continue this conversation")
+        elif outcome == "completed" and self.empty_turn:
+            logger.warning(f"{line} EMPTY_TURN: model ended its turn without text or tool calls")
+        else:
+            logger.info(line)
 
 
 async def with_idle_keepalive(

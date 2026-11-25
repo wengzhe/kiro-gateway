@@ -262,3 +262,142 @@ class TestDescribeStreamError:
     def test_other_errors_keep_their_message(self):
         assert describe_stream_error(ValueError("boom"), 300) == "boom"
         assert describe_stream_error(RuntimeError(), 300) == "RuntimeError"
+
+
+class TestEmptyTurnDetection:
+    """Tests for stop_reason tracking and the EMPTY_TURN warning."""
+
+    def test_empty_turn_when_finished_without_output(self):
+        """
+        What it does: Kiro reported a stop reason but nothing was forwarded.
+        Purpose: This is the empty reply opencode shows as a turn with no content.
+        """
+        timings = StreamTimings("POST /v1/messages")
+        timings.stop_reason = "END_TURN"
+        assert timings.empty_turn
+        assert "stop_reason=END_TURN output_events=0" in timings.summary("completed")
+
+    def test_not_empty_when_output_was_forwarded(self):
+        timings = StreamTimings("POST /v1/messages")
+        timings.stop_reason = "END_TURN"
+        timings.output_event()
+        assert not timings.empty_turn
+
+    def test_not_empty_without_stop_reason(self):
+        """
+        What it does: Stream ended with no stop reason (e.g. cut off upstream).
+        Purpose: A truncated stream is a different failure and must not be labelled EMPTY_TURN.
+        """
+        assert not StreamTimings("POST /v1/messages").empty_turn
+
+    def test_log_warns_only_for_completed_empty_turn(self):
+        from loguru import logger
+
+        records = []
+        sink = logger.add(lambda m: records.append((m.record["level"].name, m.record["message"])), level="INFO")
+        try:
+            empty = StreamTimings("POST /v1/messages")
+            empty.stop_reason = "END_TURN"
+            empty.log("completed")
+            empty.log("client disconnected")
+            normal = StreamTimings("POST /v1/messages")
+            normal.stop_reason = "TOOL_USE"
+            normal.output_event()
+            normal.log("completed")
+        finally:
+            logger.remove(sink)
+
+        levels = [lvl for lvl, msg in records if "[StreamTimings]" in msg]
+        assert levels == ["WARNING", "INFO", "INFO"]
+        assert "EMPTY_TURN" in records[0][1]
+
+
+class TestStopReasonParsing:
+    """Tests that Kiro's metadataEvent stopReason reaches the request timings."""
+
+    @pytest.mark.asyncio
+    async def test_parse_kiro_stream_records_stop_reason_and_output(self):
+        from unittest.mock import MagicMock, patch
+        from kiro.streaming_core import parse_kiro_stream
+
+        class FakeResponse:
+            async def aiter_bytes(self):
+                yield b'{"content":"hi"}'
+                yield b'{"stopReason":"END_TURN"}'
+
+        timings = StreamTimings("POST /v1/messages")
+        token = current_timings.set(timings)
+        try:
+            with patch('kiro.streaming_core.FAKE_REASONING_ENABLED', False):
+                events = [e async for e in parse_kiro_stream(FakeResponse(), first_token_timeout=0)]
+        finally:
+            current_timings.reset(token)
+
+        assert [e.type for e in events] == ["content"]
+        assert timings.stop_reason == "END_TURN"
+        assert timings.output_events == 1
+        assert not timings.empty_turn
+
+
+class TestContentFilteredRefusal:
+    """Tests for Kiro CONTENT_FILTERED stops reaching timings and the event stream."""
+
+    REFUSAL_CHUNK = (b'{"stopDetails":{"refusal":{"category":"CYBER","explanation":"Cannot continue."}},'
+                     b'"stopReason":"CONTENT_FILTERED"}')
+
+    @pytest.mark.asyncio
+    async def test_parse_kiro_stream_yields_refusal_event(self):
+        """
+        What it does: Streams a reasoning-only turn that Kiro's filter stops.
+        Goal: A refusal event is yielded and the request timings record the category.
+        """
+        from unittest.mock import patch
+        from kiro.streaming_core import parse_kiro_stream
+
+        chunk = self.REFUSAL_CHUNK
+
+        class FakeResponse:
+            async def aiter_bytes(self):
+                yield chunk
+
+        timings = StreamTimings("POST /v1/messages")
+        token = current_timings.set(timings)
+        try:
+            with patch('kiro.streaming_core.FAKE_REASONING_ENABLED', False):
+                events = [e async for e in parse_kiro_stream(FakeResponse(), first_token_timeout=0)]
+        finally:
+            current_timings.reset(token)
+
+        assert [e.type for e in events] == ["refusal"]
+        assert events[0].refusal["category"] == "CYBER"
+        assert timings.stop_reason == "CONTENT_FILTERED"
+        assert timings.refusal_category == "CYBER"
+        assert "refusal=CYBER" in timings.summary("completed")
+
+    def test_log_warns_content_filtered(self):
+        """
+        What it does: Logs a request whose response was content-filtered.
+        Goal: Filtered turns are flagged as CONTENT_FILTERED, not as a generic empty turn.
+        """
+        from loguru import logger
+
+        records = []
+        sink = logger.add(lambda m: records.append((m.record["level"].name, m.record["message"])), level="INFO")
+        try:
+            timings = StreamTimings("POST /v1/messages")
+            timings.stop_reason = "CONTENT_FILTERED"
+            timings.refusal_category = "CYBER"
+            timings.log("completed")
+        finally:
+            logger.remove(sink)
+
+        line = [r for r in records if "[StreamTimings]" in r[1]][0]
+        assert line[0] == "WARNING"
+        assert "CONTENT_FILTERED" in line[1]
+        assert "EMPTY_TURN" not in line[1]
+
+    def test_refusal_notice_names_category_and_explanation(self):
+        from kiro.streaming_core import refusal_notice
+        notice = refusal_notice({"category": "CYBER", "explanation": "Cannot continue."})
+        assert "content filter" in notice and "CYBER" in notice and "Cannot continue." in notice
+        assert "unknown" in refusal_notice({})

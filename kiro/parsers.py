@@ -246,6 +246,8 @@ class AwsEventStreamParser:
         ('{"followupPrompt":', 'followup'),
         ('{"usage":', 'usage'),
         ('{"contextUsagePercentage":', 'context_usage'),
+        ('{"stopReason":', 'stop_reason'),
+        ('{"stopDetails":', 'stop_reason'),
     ]
     
     def __init__(self):
@@ -328,6 +330,9 @@ class AwsEventStreamParser:
             return {"type": "usage", "data": data.get('usage', 0)}
         elif event_type == 'context_usage':
             return {"type": "context_usage", "data": data.get('contextUsagePercentage', 0)}
+        elif event_type == 'stop_reason':
+            refusal = (data.get('stopDetails') or {}).get('refusal')
+            return {"type": "stop_reason", "data": {"stop_reason": data.get('stopReason'), "refusal": refusal}}
         
         return None
     

@@ -45,6 +45,7 @@ from kiro.streaming_core import (
     FirstTokenTimeoutError,
     KiroEvent,
     calculate_tokens_from_context_usage,
+    refusal_notice,
     stream_with_first_token_retry,
 )
 from kiro.tokenizer import count_tokens, estimate_request_tokens
@@ -200,6 +201,8 @@ async def stream_kiro_to_anthropic(
     
     # Track truncated tool calls for recovery
     truncated_tools: List[Dict[str, Any]] = []
+    
+    refusal: Optional[Dict[str, Any]] = None
     
     try:
         # Send message_start event
@@ -523,6 +526,8 @@ async def stream_kiro_to_anthropic(
             elif event.type == "usage" and event.usage:
                 upstream_cache_usage.update(_extract_cache_usage_fields(event.usage))
                 logger.info(f"[Credits] {model}: {event.usage}")
+            elif event.type == "refusal":
+                refusal = event.refusal or {}
         
         # Track completion signals for truncation detection
         stream_completed_normally = context_usage_percentage is not None
@@ -600,6 +605,26 @@ async def stream_kiro_to_anthropic(
             })
             current_block_index += 1
         
+        # Make a content-filter stop visible instead of an empty end_turn
+        if refusal is not None:
+            notice = refusal_notice(refusal)
+            if text_block_started:
+                notice = "\n\n" + notice
+            else:
+                text_block_index = current_block_index
+                yield format_sse_event("content_block_start", {
+                    "type": "content_block_start",
+                    "index": text_block_index,
+                    "content_block": {"type": "text", "text": ""}
+                })
+                text_block_started = True
+            yield format_sse_event("content_block_delta", {
+                "type": "content_block_delta",
+                "index": text_block_index,
+                "delta": {"type": "text_delta", "text": notice}
+            })
+            full_content += notice
+        
         # Close text block if still open
         if text_block_started and text_block_index is not None:
             yield format_sse_event("content_block_stop", {
@@ -611,7 +636,8 @@ async def stream_kiro_to_anthropic(
         content_was_truncated = (
             not stream_completed_normally and
             len(full_content) > 0 and
-            not tool_blocks  # Don't confuse with tool call truncation
+            not tool_blocks and  # Don't confuse with tool call truncation
+            refusal is None
         )
         
         if content_was_truncated:
@@ -635,8 +661,10 @@ async def stream_kiro_to_anthropic(
             if prompt_source != "unknown":
                 input_tokens = prompt_tokens
         
-        # Determine stop reason (truncation has highest priority)
-        if content_was_truncated:
+        # Determine stop reason (a content-filter refusal has highest priority)
+        if refusal is not None:
+            stop_reason = "refusal"
+        elif content_was_truncated:
             stop_reason = "max_tokens"
         elif tool_blocks:
             stop_reason = "tool_use"
@@ -781,6 +809,9 @@ async def collect_anthropic_response(
     text_content = result.content
     if result.thinking_content and FAKE_REASONING_HANDLING == "include_as_text":
         text_content = result.thinking_content + text_content
+    if result.refusal is not None:
+        notice = refusal_notice(result.refusal)
+        text_content = f"{text_content}\n\n{notice}" if text_content else notice
     
     if text_content:
         content_blocks.append({
@@ -835,8 +866,10 @@ async def collect_anthropic_response(
             f"{'Model will be notified automatically about truncation.' if TRUNCATION_RECOVERY else 'Set TRUNCATION_RECOVERY=true in .env to auto-notify model about truncation.'}"
         )
     
-    # Determine stop reason (truncation has highest priority)
-    if content_was_truncated:
+    # Determine stop reason (a content-filter refusal has highest priority)
+    if result.refusal is not None:
+        stop_reason = "refusal"
+    elif content_was_truncated:
         stop_reason = "max_tokens"
     elif result.tool_calls:
         stop_reason = "tool_use"

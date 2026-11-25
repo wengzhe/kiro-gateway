@@ -69,12 +69,13 @@ class KiroEvent:
     This format is API-agnostic and can be converted to both OpenAI and Anthropic formats.
     
     Attributes:
-        type: Event type (content, thinking, tool_use, usage, context_usage, error)
+        type: Event type (content, thinking, tool_use, usage, context_usage, refusal, error)
         content: Text content (for content events)
         thinking_content: Thinking/reasoning content (for thinking events)
         tool_use: Tool use data (for tool_use events)
         usage: Usage/metering data (for usage events)
         context_usage_percentage: Context usage percentage (for context_usage events)
+        refusal: Kiro stopDetails.refusal, e.g. {"category", "explanation"} (for refusal events)
         is_first_thinking_chunk: Whether this is the first thinking chunk
         is_last_thinking_chunk: Whether this is the last thinking chunk
     """
@@ -84,6 +85,7 @@ class KiroEvent:
     tool_use: Optional[Dict[str, Any]] = None
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
+    refusal: Optional[Dict[str, Any]] = None
     is_first_thinking_chunk: bool = False
     is_last_thinking_chunk: bool = False
 
@@ -99,12 +101,14 @@ class StreamResult:
         tool_calls: List of tool calls
         usage: Usage information
         context_usage_percentage: Context usage percentage from Kiro API
+        refusal: Set when Kiro's content filter stopped the response
     """
     content: str = ""
     thinking_content: str = ""
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
+    refusal: Optional[Dict[str, Any]] = None
 
 
 class FirstTokenTimeoutError(Exception):
@@ -112,9 +116,26 @@ class FirstTokenTimeoutError(Exception):
     pass
 
 
+KIRO_CONTENT_FILTERED = "CONTENT_FILTERED"
+
+
+def refusal_notice(refusal: Dict[str, Any]) -> str:
+    """Visible text for a response that Kiro's content filter stopped."""
+    category = refusal.get("category") or "unknown"
+    explanation = refusal.get("explanation") or "The selected model cannot continue this conversation."
+    return f"[kiro-gateway] Kiro's content filter stopped this response (category: {category}). {explanation}"
+
+
 # ==================================================================================================
 # Kiro Stream Parsing
 # ==================================================================================================
+
+def _count_output(event: KiroEvent) -> None:
+    if event.type in ("content", "thinking", "tool_use"):
+        timings = current_timings.get()
+        if timings:
+            timings.output_event()
+
 
 async def parse_kiro_stream(
     response: httpx.Response,
@@ -177,6 +198,7 @@ async def parse_kiro_stream(
         async for event in _process_chunk(parser, first_byte_chunk, thinking_parser):
             if event.type == "content" or event.type == "thinking":
                 first_token_received = True
+            _count_output(event)
             yield event
         
         # Continue reading remaining chunks
@@ -185,6 +207,7 @@ async def parse_kiro_stream(
                 debug_logger.log_raw_chunk(chunk)
             
             async for event in _process_chunk(parser, chunk, thinking_parser):
+                _count_output(event)
                 yield event
         
         # Finalize thinking parser and yield any remaining content
@@ -198,15 +221,19 @@ async def parse_kiro_stream(
                     final_result.is_last_thinking_chunk,
                 )
                 if processed_thinking:
-                    yield KiroEvent(
+                    event = KiroEvent(
                         type="thinking",
                         thinking_content=processed_thinking,
                         is_first_thinking_chunk=final_result.is_first_thinking_chunk,
                         is_last_thinking_chunk=final_result.is_last_thinking_chunk,
                     )
+                    _count_output(event)
+                    yield event
             
             if final_result.regular_content:
-                yield KiroEvent(type="content", content=final_result.regular_content)
+                event = KiroEvent(type="content", content=final_result.regular_content)
+                _count_output(event)
+                yield event
             
             if thinking_parser.found_thinking_block:
                 logger.debug("Thinking block processing completed")
@@ -217,7 +244,9 @@ async def parse_kiro_stream(
         
         # Yield tool calls if any
         for tc in all_tool_calls:
-            yield KiroEvent(type="tool_use", tool_use=tc)
+            event = KiroEvent(type="tool_use", tool_use=tc)
+            _count_output(event)
+            yield event
             
     except FirstTokenTimeoutError:
         raise
@@ -284,6 +313,17 @@ async def _process_chunk(
         
         elif event["type"] == "context_usage":
             yield KiroEvent(type="context_usage", context_usage_percentage=event["data"])
+        
+        elif event["type"] == "stop_reason":
+            stop_reason = event["data"]["stop_reason"]
+            refusal = event["data"]["refusal"]
+            timings = current_timings.get()
+            if timings:
+                timings.stop_reason = stop_reason
+                if refusal:
+                    timings.refusal_category = refusal.get("category") or "unknown"
+            if stop_reason == KIRO_CONTENT_FILTERED or refusal:
+                yield KiroEvent(type="refusal", refusal=refusal or {})
 
 
 # ==================================================================================================
@@ -325,6 +365,8 @@ async def collect_stream_to_result(
             result.usage = event.usage
         elif event.type == "context_usage" and event.context_usage_percentage is not None:
             result.context_usage_percentage = event.context_usage_percentage
+        elif event.type == "refusal":
+            result.refusal = event.refusal or {}
     
     # Check for bracket-style tool calls in full content
     bracket_tool_calls = parse_bracket_tool_calls(full_content_for_bracket_tools)

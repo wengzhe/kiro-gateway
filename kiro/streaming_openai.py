@@ -51,6 +51,7 @@ from kiro.streaming_core import (
     FirstTokenTimeoutError,
     KiroEvent,
     calculate_tokens_from_context_usage,
+    refusal_notice,
     stream_with_first_token_retry as stream_with_first_token_retry_core,
 )
 
@@ -125,6 +126,7 @@ async def stream_kiro_to_openai_internal(
     
     streaming_error_occurred = False
     tool_calls_from_stream = []
+    refusal: Optional[dict] = None
     
     try:
         # Use streaming_core.parse_kiro_stream for unified event parsing
@@ -267,6 +269,9 @@ async def stream_kiro_to_openai_internal(
             
             elif event.type == "context_usage" and event.context_usage_percentage is not None:
                 context_usage_percentage = event.context_usage_percentage
+            
+            elif event.type == "refusal":
+                refusal = event.refusal or {}
         
         # Track completion signals for truncation detection
         received_usage = metering_data is not None
@@ -293,8 +298,32 @@ async def stream_kiro_to_openai_internal(
                 f"{'Model will be notified automatically about truncation.' if TRUNCATION_RECOVERY else 'Set TRUNCATION_RECOVERY=true in .env to auto-notify model about truncation.'}"
             )
         
-        # Determine finish_reason (truncation has highest priority)
-        if content_was_truncated:
+        # Make a content-filter stop visible instead of an empty reply
+        if refusal is not None:
+            notice = refusal_notice(refusal)
+            if full_content:
+                notice = "\n\n" + notice
+            delta = {"content": notice}
+            if first_chunk:
+                delta["role"] = "assistant"
+                first_chunk = False
+            refusal_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+            }
+            chunk_text = f"data: {json.dumps(refusal_chunk, ensure_ascii=False)}\n\n"
+            if debug_logger:
+                debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
+            yield chunk_text
+            full_content += notice
+        
+        # Determine finish_reason (a content-filter refusal has highest priority)
+        if refusal is not None:
+            finish_reason = "content_filter"
+        elif content_was_truncated:
             finish_reason = "length"
         elif all_tool_calls:
             finish_reason = "tool_calls"

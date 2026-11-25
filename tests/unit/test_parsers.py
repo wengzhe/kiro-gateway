@@ -1357,3 +1357,28 @@ class TestTruncationRecoveryIntegration:
         
         print("Checking: Third tool call NOT marked as truncated...")
         assert aws_event_parser.tool_calls[2].get("_truncation_detected") is not True
+
+class TestAwsEventStreamParserStopReason:
+    """Tests for Kiro metadataEvent stopReason / stopDetails parsing."""
+
+    def test_parses_plain_stop_reason(self, aws_event_parser):
+        """
+        What it does: Parses a normal end-of-turn metadata event.
+        Goal: stop_reason is reported and no refusal is attached.
+        """
+        events = aws_event_parser.feed(b'{"stopReason":"END_TURN"}')
+        assert events == [{"type": "stop_reason", "data": {"stop_reason": "END_TURN", "refusal": None}}]
+
+    def test_parses_content_filtered_refusal(self, aws_event_parser):
+        """
+        What it does: Parses the metadata Kiro sends when its content filter stops a turn.
+        Goal: category and explanation reach the gateway instead of being dropped.
+        """
+        chunk = (b'{"stopDetails":{"refusal":{"category":"CYBER","explanation":"The selected model '
+                 b'cannot continue this conversation."}},"stopReason":"CONTENT_FILTERED"}')
+        events = aws_event_parser.feed(chunk)
+        print(f"Result: {events}")
+        assert len(events) == 1
+        assert events[0]["type"] == "stop_reason"
+        assert events[0]["data"]["stop_reason"] == "CONTENT_FILTERED"
+        assert events[0]["data"]["refusal"]["category"] == "CYBER"
